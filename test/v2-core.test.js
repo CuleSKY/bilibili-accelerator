@@ -205,3 +205,80 @@ test("force mode still respects mcdn proxy ordering", () => {
   assert.equal(detail.reason, "mcdn-proxy");
   assert.equal(new URL(detail.url).hostname, "proxy-tf-all-ws.bilivideo.com");
 });
+
+// ---- v3: overseas-first candidate pool ----------------------------------------
+
+test("the candidate pool spans both the overseas and mainland tiers", () => {
+  // Auto-selection can only ever pick a host that is in this pool, so both
+  // tiers have to be present: overseas viewers measured the *ov mirrors 4-9x
+  // faster, while a viewer in Tokyo (issue #26) probed upos-sz-mirrorcos as
+  // their fastest host. Neither tier may be assumed away — the probe decides.
+  ["upos-sz-mirrorcosov.bilivideo.com",
+   "upos-sz-mirroraliov.bilivideo.com",
+   "upos-sz-mirrorhwov.bilivideo.com",
+   "upos-sz-mirrorcos.bilivideo.com",
+   "upos-sz-mirrorali.bilivideo.com",
+   "upos-sz-mirrorhw.bilivideo.com",
+   "upos-tf-all-hw.bilivideo.com",
+   "upos-tf-all-tx.bilivideo.com"].forEach((host) => {
+    assert.ok(core.CANDIDATE_POOL.includes(host), host + " must be a candidate");
+  });
+});
+
+test("akamai stays out of the candidate pool", () => {
+  // Akamai answers a upos-signed path with 403, so it can never pass the
+  // probe's response.ok check — listing it would just burn a probe slot.
+  assert.ok(!core.CANDIDATE_POOL.some((h) => h.includes("akamaized.net")));
+});
+
+test("a stored v2 config is migrated onto the widened candidate pool", () => {
+  const v2 = {
+    schemaVersion: 2,
+    selection: "auto",
+    pcdnHost: "upos-sz-mirrorcos.bilivideo.com",
+    candidatePool: [
+      "upos-sz-mirrorcos.bilivideo.com",
+      "upos-sz-mirrorali.bilivideo.com",
+      "upos-sz-mirrorhw.bilivideo.com",
+      "upos-tf-all-hw.bilivideo.com",
+      "upos-tf-all-tx.bilivideo.com"
+    ]
+  };
+  const cfg = core.normalizeConfig(v2);
+
+  assert.deepEqual(cfg.candidatePool, core.CANDIDATE_POOL.slice(),
+    "the stale mainland-only pool is replaced, not preserved");
+  assert.equal(cfg.pcdnHost, core.DEFAULT_CONFIG.pcdnHost,
+    "the retired default target is moved off the mainland mirror");
+  assert.equal(cfg.schemaVersion, core.SCHEMA_VERSION);
+});
+
+test("migration keeps a host the user pinned in fixed mode", () => {
+  const cfg = core.normalizeConfig({
+    schemaVersion: 2,
+    selection: "fixed",
+    pcdnHost: "upos-sz-mirrorcos.bilivideo.com"
+  });
+  assert.equal(cfg.pcdnHost, "upos-sz-mirrorcos.bilivideo.com");
+  assert.deepEqual(cfg.candidatePool, core.CANDIDATE_POOL.slice());
+});
+
+test("migration leaves a non-default auto target alone", () => {
+  const cfg = core.normalizeConfig({
+    schemaVersion: 2,
+    selection: "auto",
+    pcdnHost: "upos-tf-all-hw.bilivideo.com"
+  });
+  assert.equal(cfg.pcdnHost, "upos-tf-all-hw.bilivideo.com");
+});
+
+test("an already-current config is not re-migrated", () => {
+  const cfg = core.normalizeConfig({
+    schemaVersion: core.SCHEMA_VERSION,
+    selection: "auto",
+    pcdnHost: "upos-sz-mirrorcos.bilivideo.com",
+    candidatePool: ["upos-sz-mirrorhw.bilivideo.com"]
+  });
+  assert.equal(cfg.pcdnHost, "upos-sz-mirrorcos.bilivideo.com");
+  assert.deepEqual(cfg.candidatePool, ["upos-sz-mirrorhw.bilivideo.com"]);
+});

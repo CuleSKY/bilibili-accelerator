@@ -9,10 +9,12 @@
 })(typeof globalThis !== "undefined" ? globalThis : window, function createCore() {
   "use strict";
 
-  const SCHEMA_VERSION = 2;
+  const SCHEMA_VERSION = 3;
 
-  // Healthy UPOS mirrors we are willing to rewrite toward. The first entry is
-  // the default target; the whole list seeds the auto-selection candidate pool.
+  // Healthy UPOS mirrors we are willing to rewrite toward. The default target
+  // is DEFAULT_CONFIG.pcdnHost and the auto-selection pool is CANDIDATE_POOL;
+  // this list is the wider allowlist, and its first entry is only the last-ditch
+  // fallback for a config whose pcdnHost has somehow been emptied.
   const CDN_HOSTS = Object.freeze([
     "upos-sz-mirrorcos.bilivideo.com",
     "upos-sz-mirrorali.bilivideo.com",
@@ -40,13 +42,34 @@
   ]);
   const THEME_MODES = Object.freeze(["system", "light", "dark"]);
 
-  // Candidates that are safe to auto-probe and rank: non-akamai, non-overseas
-  // mirrors that work well as generic rewrite targets.
+  // Candidates that are safe to auto-probe and rank as rewrite targets. Akamai
+  // is excluded: it rejects a upos-signed path with 403, so it can never win a
+  // probe and only wastes a slot.
+  //
+  // Overseas mirrors lead the list and mainland mirrors follow. The runtime
+  // probes only the first six entries, so ordering decides what auto-selection
+  // is even allowed to consider — and for this tool's audience the *ov mirrors
+  // are the fast tier. Measured from Seattle on a 1 Gbps line, re-requesting the
+  // same signed segment on each host:
+  //
+  //   upos-sz-mirrorcosov   240ms TTFB   59.5 Mbps   <- what Bilibili serves
+  //   upos-sz-mirroraliov   257ms TTFB   40.0 Mbps
+  //   upos-sz-mirrorali     824ms TTFB   13.1 Mbps
+  //   upos-tf-all-hw       1152ms TTFB   10.3 Mbps
+  //   upos-sz-mirrorhw     1163ms TTFB    9.9 Mbps
+  //   upos-sz-mirrorcos    1116ms TTFB    6.5 Mbps
+  //
+  // A mainland-only pool made every rotation a 4-9x downgrade off the host
+  // Bilibili had already picked correctly. Probing still decides the final
+  // order, so a mainland viewer ranks the mainland hosts first as before.
   const CANDIDATE_POOL = Object.freeze([
-    "upos-sz-mirrorcos.bilivideo.com",
+    "upos-sz-mirrorcosov.bilivideo.com",
+    "upos-sz-mirroraliov.bilivideo.com",
+    "upos-sz-mirrorhwov.bilivideo.com",
     "upos-sz-mirrorali.bilivideo.com",
-    "upos-sz-mirrorhw.bilivideo.com",
     "upos-tf-all-hw.bilivideo.com",
+    "upos-sz-mirrorhw.bilivideo.com",
+    "upos-sz-mirrorcos.bilivideo.com",
     "upos-tf-all-tx.bilivideo.com"
   ]);
 
@@ -57,7 +80,9 @@
     theme: "system",                               // system | light | dark surface
     mode: "bad-only",                              // bad-only | force | off
     selection: "auto",                             // auto | fixed
-    pcdnHost: "upos-sz-mirrorcos.bilivideo.com",
+    // Pre-probe rewrite target. Overseas by default to match the audience; auto
+    // selection replaces it with the best-ranked host once probing finishes.
+    pcdnHost: "upos-sz-mirrorcosov.bilivideo.com",
     candidatePool: CANDIDATE_POOL.slice(),
     mcdnStrategy: "proxy-all",                      // proxy-all | proxy-v1 | replace
     proxyHost: "proxy-tf-all-ws.bilivideo.com",
@@ -102,9 +127,31 @@
     return hostname.indexOf("upos-") === 0 && hostname.split(".")[0].indexOf("302") !== -1;
   }
 
-  // Forward-migrate any stored config (v1 or partial) onto the v2 defaults.
+  // Forward-migrate any stored config (v1 or partial) onto the current defaults.
   function normalizeConfig(config) {
+    // Read the version off the raw input: the merge below backfills it from
+    // DEFAULT_CONFIG, which would make every stored config look current.
+    const storedVersion = config && config.schemaVersion;
     const merged = Object.assign({}, DEFAULT_CONFIG, config || {});
+
+    // v3 widened the candidate pool to take in the overseas mirrors. The pool is
+    // not user-editable, so a stored copy is only ever an older default — and
+    // since a non-empty array satisfies the check below, leaving it alone would
+    // pin existing installs to the mainland-only pool permanently.
+    if (!(storedVersion >= 3)) {
+      merged.candidatePool = CANDIDATE_POOL.slice();
+      // Retire the old default target, which auto mode would otherwise keep
+      // using until its first probe lands. Narrow on purpose: only a config
+      // that carries an older version is a saved one, so an explicit host from
+      // a partial/ad-hoc config is never second-guessed. A host the user pinned
+      // is left alone too — in auto mode it is ephemeral anyway, since
+      // applyRanking overwrites it as soon as probing finishes.
+      if (typeof storedVersion === "number" && merged.selection !== "fixed" &&
+          cleanHost(merged.pcdnHost) === "upos-sz-mirrorcos.bilivideo.com") {
+        merged.pcdnHost = DEFAULT_CONFIG.pcdnHost;
+      }
+    }
+
     if (!Array.isArray(merged.candidatePool) || merged.candidatePool.length === 0) {
       merged.candidatePool = CANDIDATE_POOL.slice();
     }

@@ -10,7 +10,10 @@
   const VERSION = "0.4.0";
   const STORAGE_KEY = "biliAccelerator.config.v2";
   const LEGACY_KEY = "biliAccelerator.config.v1";
-  const RANK_PREFIX = "biliAccelerator.rank.";
+  // Bumped when the candidate pool changes: a cached ranking only ever contains
+  // hosts from the pool that produced it, so a stale entry would pin viewers to
+  // the old mainland-only set for up to RANK_TTL_MS after an update.
+  const RANK_PREFIX = "biliAccelerator.rank.v2.";
   const RANK_TTL_MS = 6 * 60 * 60 * 1000;
   const BUTTON_ID = "bili-accelerator-button";
   const PANEL_ID = "bili-accelerator-panel";
@@ -21,6 +24,9 @@
   const STALL_GRACE_MS = 2500;
   const STALL_RETRY_MS = 5000;
   const PROBE_TIMEOUT_MS = 4000;
+  // Upper bound on parallel probes. Kept at or above CANDIDATE_POOL's length so
+  // the pool is measured in full — a unit test holds the two together.
+  const PROBE_MAX_HOSTS = 12;
 
   const nativeJsonParse = JSON.parse;
   const nativeFetch = root.fetch;
@@ -33,6 +39,7 @@
   let probed = false;
   let watchedVideo = null;
   let stallTimer = null;
+  let rotateCursor = 0;
 
   const recovery = { avoidHost: null, clearTimer: null };
 
@@ -813,7 +820,12 @@
       renderStatus();
       return;
     }
-    const hosts = (config.candidatePool || []).slice(0, 6);
+    // Probe every candidate. This used to stop at the first six, which silently
+    // made pool *order* decide what auto-selection could pick: a viewer whose
+    // fastest host sat in position seven could never be ranked onto it. The
+    // probes run in parallel and abort their bodies once headers land, so the
+    // whole pool costs one round of a few KB, once per RANK_TTL_MS.
+    const hosts = (config.candidatePool || []).slice(0, PROBE_MAX_HOSTS);
     if (!hosts.length) {
       return;
     }
@@ -833,14 +845,25 @@
       .catch(function () {});
   }
 
+  // Walk the ranked pool one step per stall, wrapping at the end. Taking the
+  // first entry that isn't the current host instead — as this did originally —
+  // ping-pongs between the top two entries forever: rank[0] rotates to rank[1],
+  // whose own stall rotates straight back to rank[0]. The rest of the pool was
+  // unreachable, and a viewer whose best two hosts were both congested saw
+  // "switching servers" every five seconds with nothing to show for it.
   function rotateTarget(stallingHost) {
     const pool = (state.ranking.length ? state.ranking : config.candidatePool).slice();
+    if (!pool.length) {
+      return;
+    }
     const current = config.pcdnHost;
-    const next = pool.filter(function (h) {
-      return h !== current && h !== stallingHost;
-    })[0] || pool.find(function (h) { return h !== current; });
-    if (next) {
-      config.pcdnHost = next;
+    for (let i = 0; i < pool.length; i += 1) {
+      rotateCursor = (rotateCursor + 1) % pool.length;
+      const candidate = pool[rotateCursor];
+      if (candidate !== current && candidate !== stallingHost) {
+        config.pcdnHost = candidate;
+        break;
+      }
     }
     recovery.avoidHost = stallingHost || current;
     if (recovery.clearTimer) {
