@@ -63,22 +63,17 @@
   // is excluded: it rejects a upos-signed path with 403, so it can never win a
   // probe and only wastes a slot.
   //
-  // Overseas mirrors lead the list and mainland mirrors follow. The runtime
-  // probes only the first six entries, so ordering decides what auto-selection
-  // is even allowed to consider — and for this tool's audience the *ov mirrors
-  // are the fast tier. Measured from Seattle on a 1 Gbps line, re-requesting the
-  // same signed segment on each host:
+  // Both tiers belong here and the probe decides between them; the order below
+  // only sets the pre-probe preference. Overseas leads because that is this
+  // tool's audience — measured from Seattle, re-requesting the same signed
+  // segment on each host gave 33-70 Mbps for the *ov mirrors against 3-20 for
+  // mainland, so a mainland-only pool made every rotation a large downgrade off
+  // the host Bilibili had already picked correctly.
   //
-  //   upos-sz-mirrorcosov   240ms TTFB   59.5 Mbps   <- what Bilibili serves
-  //   upos-sz-mirroraliov   257ms TTFB   40.0 Mbps
-  //   upos-sz-mirrorali     824ms TTFB   13.1 Mbps
-  //   upos-tf-all-hw       1152ms TTFB   10.3 Mbps
-  //   upos-sz-mirrorhw     1163ms TTFB    9.9 Mbps
-  //   upos-sz-mirrorcos    1116ms TTFB    6.5 Mbps
-  //
-  // A mainland-only pool made every rotation a 4-9x downgrade off the host
-  // Bilibili had already picked correctly. Probing still decides the final
-  // order, so a mainland viewer ranks the mainland hosts first as before.
+  // Do not read that as "overseas is always right". Issue #26 is a viewer in
+  // Tokyo whose fastest host is mainland upos-sz-mirrorcos, and the whole pool
+  // is probed, so their ranking comes out mainland-first exactly as it should.
+  // Baking either geography into this list is the bug, not the fix.
   const CANDIDATE_POOL = Object.freeze([
     "upos-sz-mirrorcosov.bilivideo.com",
     "upos-sz-mirroraliov.bilivideo.com",
@@ -405,9 +400,9 @@
     // dropping overseas mirrors from isSlow was meant to end. Genuinely
     // suspicious hosts are still caught: an *ov name on a PCDN-ish port trips
     // the port heuristic and shows up as isSlow regardless of this.
-    const force = config.mode === "force" &&
+    const forceApplies = config.mode === "force" &&
       isBiliCdnHost(url.hostname) && !isOverseasMirror(url.hostname);
-    if (verdict.isSlow || verdict.isMcdn || force) {
+    if (verdict.isSlow || verdict.isMcdn || forceApplies) {
       const target = selectTarget(config);
       const rewritten = replaceHost(url, target);
       return {
@@ -1503,12 +1498,17 @@
     const controller = typeof AbortController === "function" ? new AbortController() : null;
     let timer = null;
     let settled = false;
+    // Kept out here so the catch below can still score a transfer the timeout
+    // interrupted, rather than throwing the measurement away.
+    let ttfbMs = null;
+    let firstByteAt = 0;
+    let bytes = 0;
     if (controller) {
       init.signal = controller.signal;
       timer = setTimeout(function () { controller.abort(); }, PROBE_TIMEOUT_MS);
     }
     const probe = nativeFetch(url, init).then(function (response) {
-      const ttfb = nowMs() - started;
+      ttfbMs = nowMs() - started;
       const body = response.body;
       if (!response.ok) {
         try { if (body && body.cancel) { body.cancel(); } } catch (_) {}
@@ -1516,11 +1516,10 @@
       }
       // Engines without a readable stream still get ranked, on TTFB alone.
       if (!body || typeof body.getReader !== "function") {
-        return { host, ttfb, mbps: 0, ok: true };
+        return { host, ttfb: ttfbMs, mbps: 0, ok: true };
       }
       const reader = body.getReader();
-      const firstByteAt = nowMs();
-      let bytes = 0;
+      firstByteAt = nowMs();
       function pump() {
         return reader.read().then(function (chunk) {
           if (chunk.value) {
@@ -1529,13 +1528,26 @@
           if (chunk.done || bytes >= PROBE_BYTES) {
             const elapsed = nowMs() - firstByteAt;
             try { reader.cancel(); } catch (_) {}
-            return { host, ttfb, mbps: core.throughputMbps(bytes, elapsed), ok: true };
+            return { host, ttfb: ttfbMs, mbps: core.throughputMbps(bytes, elapsed), ok: true };
           }
           return pump();
         });
       }
       return pump();
     }).catch(function () {
+      // A host too slow to deliver PROBE_BYTES inside PROBE_TIMEOUT_MS gets
+      // aborted mid-read. It is slow, not broken, and dropping it entirely left
+      // rotation with nothing to fall back to once the faster hosts were
+      // exhausted — one report came back with only four of eight hosts ranked.
+      // Score the bytes it did move so it sorts to the bottom and stays usable.
+      if (ttfbMs !== null && bytes > 0) {
+        return {
+          host,
+          ttfb: ttfbMs,
+          mbps: core.throughputMbps(bytes, nowMs() - firstByteAt),
+          ok: true
+        };
+      }
       return { host, ttfb: null, mbps: 0, ok: false };
     }).then(function (result) {
       settled = true;
@@ -1574,9 +1586,12 @@
     }
     // Probe every candidate. This used to stop at the first six, which silently
     // made pool *order* decide what auto-selection could pick: a viewer whose
-    // fastest host sat in position seven could never be ranked onto it. The
-    // probes run in parallel and abort their bodies once headers land, so the
-    // whole pool costs one round of a few KB, once per RANK_TTL_MS.
+    // fastest host sat in position seven could never be ranked onto it.
+    //
+    // Probes run in parallel and each reads up to PROBE_BYTES, so a full round
+    // costs on the order of PROBE_BYTES x pool size — a few MB, once per
+    // RANK_TTL_MS. That buys a throughput number; scoring on headers alone was
+    // cheaper but ranked the wrong host (see probeHost).
     const hosts = (config.candidatePool || []).slice(0, PROBE_MAX_HOSTS);
     if (!hosts.length) {
       return;

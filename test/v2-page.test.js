@@ -401,3 +401,51 @@ test("the probe reads segment bytes instead of scoring on headers alone", () => 
       "probe must stop at PROBE_BYTES per host, read " + bytesServed);
   });
 });
+
+test("a host aborted mid-transfer is ranked as slow, not dropped", () => {
+  // PROBE_TIMEOUT_MS aborts a host too slow to deliver PROBE_BYTES in time. It
+  // is slow, not broken: discarding it shrank one real ranking to four of eight
+  // hosts, leaving rotation with nothing to fall back on once the fast hosts
+  // were exhausted. The bytes it did move are a valid (low) measurement.
+  const slowHost = "upos-tf-all-tx.bilivideo.com";
+  const sandbox = loadPage({
+    Uint8Array,
+    fetch: (url) => {
+      const host = new URL(url).hostname;
+      let served = 0;
+      return Promise.resolve({
+        ok: true,
+        headers: { get: () => "video/mp4" },
+        body: {
+          getReader: () => ({
+            read() {
+              served += 64 * 1024;
+              // The slow host gets aborted partway through, like a real timeout.
+              if (host === slowHost && served > 128 * 1024) {
+                return Promise.reject(new Error("aborted"));
+              }
+              return Promise.resolve({
+                done: served > 768 * 1024,
+                value: new Uint8Array(64 * 1024)
+              });
+            },
+            cancel() {}
+          })
+        }
+      });
+    }
+  });
+
+  sandbox.JSON.parse(JSON.stringify({
+    data: { dash: { video: [
+      { baseUrl: "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/v.m4s?x=1" }
+    ] } }
+  }));
+
+  return new Promise((resolve) => setTimeout(resolve, 50)).then(() => {
+    const ranking = sandbox.BiliAccelerator.getStats().ranking;
+    assert.ok(ranking.includes(slowHost),
+      "the aborted host must stay rankable: " + JSON.stringify(ranking));
+    assert.notEqual(ranking[0], slowHost, "but it must not win");
+  });
+});
