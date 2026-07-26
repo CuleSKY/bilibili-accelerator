@@ -347,3 +347,57 @@ test("every candidate host is probed, not just the first few", () => {
     "PROBE_MAX_HOSTS (" + cap + ") must cover the whole " +
     core.CANDIDATE_POOL.length + "-host pool");
 });
+
+test("the probe reads segment bytes instead of scoring on headers alone", () => {
+  // probeHost used to cancel the body the moment headers landed and rank purely
+  // on TTFB. On these hosts TTFB swings ~10x between back-to-back samples of the
+  // SAME host, so one unlucky draw — cached for RANK_TTL_MS — pinned a viewer to
+  // a mainland mirror that moved a third of the bytes. Ranking now needs a real
+  // rate, which means the probe has to actually pull bytes. Ordering semantics
+  // are covered by the rankHosts tests in v2-core; what matters here is that the
+  // body is consumed at all, which the old implementation never did.
+  const core = require("../src/core/rewrite");
+  let readCalls = 0;
+  let bytesServed = 0;
+  let cancelledAtHeaders = 0;
+
+  const sandbox = loadPage({
+    Uint8Array,
+    fetch: () => Promise.resolve({
+      ok: true,
+      headers: { get: () => "video/mp4" },
+      body: {
+        cancel() { cancelledAtHeaders += 1; },
+        getReader: () => ({
+          read() {
+            readCalls += 1;
+            bytesServed += 64 * 1024;
+            return Promise.resolve({ done: false, value: new Uint8Array(64 * 1024) });
+          },
+          cancel() {}
+        })
+      }
+    })
+  });
+
+  // A playinfo payload hands rememberSample() a signed URL to probe with.
+  sandbox.JSON.parse(JSON.stringify({
+    data: { dash: { video: [
+      { baseUrl: "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/v.m4s?x=1" }
+    ] } }
+  }));
+
+  return new Promise((resolve) => setTimeout(resolve, 50)).then(() => {
+    assert.ok(readCalls > 0,
+      "probe must consume the body; the old code cancelled at headers");
+    assert.equal(cancelledAtHeaders, 0,
+      "a healthy response must not be discarded before any bytes are read");
+    // Each probe stops at PROBE_BYTES, so the pool moves that much per host.
+    const src = fs.readFileSync(path.join(__dirname, "../src/page/bili-accelerator.page.js"), "utf8");
+    const probeBytes = eval(/PROBE_BYTES = ([^;]+);/.exec(src)[1]);
+    assert.ok(bytesServed >= probeBytes,
+      "expected at least " + probeBytes + " bytes read, got " + bytesServed);
+    assert.ok(bytesServed <= probeBytes * core.CANDIDATE_POOL.length + 64 * 1024,
+      "probe must stop at PROBE_BYTES per host, read " + bytesServed);
+  });
+});

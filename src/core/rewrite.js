@@ -223,6 +223,16 @@
     return /\.mcdn\.bilivideo\.(?:cn|com|net)$/i.test(hostname);
   }
 
+  // Bilibili's own overseas UPOS mirrors (mirrorcosov / aliov / hwov). classify()
+  // deliberately does not treat these as slow — for this tool's audience they are
+  // the geographically correct hosts. This exists only so force mode can leave
+  // them alone too; it is not a "slow" signal.
+  function isOverseasMirror(hostname) {
+    return hostname.indexOf("upos-") === 0 &&
+      hostname.endsWith(".bilivideo.com") &&
+      /ov$/.test(hostname.split(".")[0]);
+  }
+
   function isBiliCdnHost(hostname) {
     return hostname.endsWith(".bilivideo.com") ||
       hostname.endsWith(".bilivideo.cn") ||
@@ -370,8 +380,17 @@
       };
     }
 
-    const force = config.mode === "force";
-    if (verdict.isSlow || verdict.isMcdn || (force && isBiliCdnHost(url.hostname))) {
+    // Force mode stops short of the overseas mirrors. Its job is to move a
+    // viewer onto their best-ranked host when Bilibili hands them a mediocre
+    // one — not to overrule a correct choice. A real diagnostics report had
+    // force mode rewriting every mirrorcosov segment onto a mainland mirror the
+    // probe had mis-ranked first, rebuilding the exact transpacific stall that
+    // dropping overseas mirrors from isSlow was meant to end. Genuinely
+    // suspicious hosts are still caught: an *ov name on a PCDN-ish port trips
+    // the port heuristic and shows up as isSlow regardless of this.
+    const force = config.mode === "force" &&
+      isBiliCdnHost(url.hostname) && !isOverseasMirror(url.hostname);
+    if (verdict.isSlow || verdict.isMcdn || force) {
       const target = selectTarget(config);
       const rewritten = replaceHost(url, target);
       return {
@@ -490,21 +509,34 @@
     }
   }
 
-  // Pure ranking of probed hosts. samples: [{host, ttfb:number|null, ok:bool}].
-  // Healthy hosts first (lowest TTFB wins); failures sink to the bottom.
+  // Pure ranking of probed hosts. samples: [{host, ttfb:number|null,
+  // mbps?:number, ok:bool}]. Healthy hosts first; failures sink to the bottom.
+  //
+  // Transfer rate decides when it was measured, and TTFB only breaks ties. Time
+  // to first byte is mostly RTT, and on these hosts it swings about tenfold
+  // between back-to-back samples of the same host — ranking on it let a mainland
+  // mirror that answered headers promptly outrank an overseas one that actually
+  // moves 3-4x the bytes. What a stalling player needs is sustained throughput.
   function rankHosts(samples) {
     return (samples || [])
       .slice()
       .sort(function compare(a, b) {
-        const aOk = a.ok && typeof a.ttfb === "number";
-        const bOk = b.ok && typeof b.ttfb === "number";
+        const aOk = a.ok && (typeof a.mbps === "number" || typeof a.ttfb === "number");
+        const bOk = b.ok && (typeof b.mbps === "number" || typeof b.ttfb === "number");
         if (aOk !== bOk) {
           return aOk ? -1 : 1;
         }
-        if (aOk && bOk) {
-          return a.ttfb - b.ttfb;
+        if (!aOk) {
+          return 0;
         }
-        return 0;
+        const aRate = typeof a.mbps === "number" ? a.mbps : 0;
+        const bRate = typeof b.mbps === "number" ? b.mbps : 0;
+        if (aRate !== bRate) {
+          return bRate - aRate;
+        }
+        const aLat = typeof a.ttfb === "number" ? a.ttfb : Infinity;
+        const bLat = typeof b.ttfb === "number" ? b.ttfb : Infinity;
+        return aLat - bLat;
       })
       .map(function pickHost(sample) {
         return cleanHost(sample.host);

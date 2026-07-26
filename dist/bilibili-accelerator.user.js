@@ -240,6 +240,16 @@
     return /\.mcdn\.bilivideo\.(?:cn|com|net)$/i.test(hostname);
   }
 
+  // Bilibili's own overseas UPOS mirrors (mirrorcosov / aliov / hwov). classify()
+  // deliberately does not treat these as slow — for this tool's audience they are
+  // the geographically correct hosts. This exists only so force mode can leave
+  // them alone too; it is not a "slow" signal.
+  function isOverseasMirror(hostname) {
+    return hostname.indexOf("upos-") === 0 &&
+      hostname.endsWith(".bilivideo.com") &&
+      /ov$/.test(hostname.split(".")[0]);
+  }
+
   function isBiliCdnHost(hostname) {
     return hostname.endsWith(".bilivideo.com") ||
       hostname.endsWith(".bilivideo.cn") ||
@@ -387,8 +397,17 @@
       };
     }
 
-    const force = config.mode === "force";
-    if (verdict.isSlow || verdict.isMcdn || (force && isBiliCdnHost(url.hostname))) {
+    // Force mode stops short of the overseas mirrors. Its job is to move a
+    // viewer onto their best-ranked host when Bilibili hands them a mediocre
+    // one — not to overrule a correct choice. A real diagnostics report had
+    // force mode rewriting every mirrorcosov segment onto a mainland mirror the
+    // probe had mis-ranked first, rebuilding the exact transpacific stall that
+    // dropping overseas mirrors from isSlow was meant to end. Genuinely
+    // suspicious hosts are still caught: an *ov name on a PCDN-ish port trips
+    // the port heuristic and shows up as isSlow regardless of this.
+    const force = config.mode === "force" &&
+      isBiliCdnHost(url.hostname) && !isOverseasMirror(url.hostname);
+    if (verdict.isSlow || verdict.isMcdn || force) {
       const target = selectTarget(config);
       const rewritten = replaceHost(url, target);
       return {
@@ -507,21 +526,34 @@
     }
   }
 
-  // Pure ranking of probed hosts. samples: [{host, ttfb:number|null, ok:bool}].
-  // Healthy hosts first (lowest TTFB wins); failures sink to the bottom.
+  // Pure ranking of probed hosts. samples: [{host, ttfb:number|null,
+  // mbps?:number, ok:bool}]. Healthy hosts first; failures sink to the bottom.
+  //
+  // Transfer rate decides when it was measured, and TTFB only breaks ties. Time
+  // to first byte is mostly RTT, and on these hosts it swings about tenfold
+  // between back-to-back samples of the same host — ranking on it let a mainland
+  // mirror that answered headers promptly outrank an overseas one that actually
+  // moves 3-4x the bytes. What a stalling player needs is sustained throughput.
   function rankHosts(samples) {
     return (samples || [])
       .slice()
       .sort(function compare(a, b) {
-        const aOk = a.ok && typeof a.ttfb === "number";
-        const bOk = b.ok && typeof b.ttfb === "number";
+        const aOk = a.ok && (typeof a.mbps === "number" || typeof a.ttfb === "number");
+        const bOk = b.ok && (typeof b.mbps === "number" || typeof b.ttfb === "number");
         if (aOk !== bOk) {
           return aOk ? -1 : 1;
         }
-        if (aOk && bOk) {
-          return a.ttfb - b.ttfb;
+        if (!aOk) {
+          return 0;
         }
-        return 0;
+        const aRate = typeof a.mbps === "number" ? a.mbps : 0;
+        const bRate = typeof b.mbps === "number" ? b.mbps : 0;
+        if (aRate !== bRate) {
+          return bRate - aRate;
+        }
+        const aLat = typeof a.ttfb === "number" ? a.ttfb : Infinity;
+        const bLat = typeof b.ttfb === "number" ? b.ttfb : Infinity;
+        return aLat - bLat;
       })
       .map(function pickHost(sample) {
         return cleanHost(sample.host);
@@ -699,10 +731,12 @@
   const VERSION = "0.4.0";
   const STORAGE_KEY = "biliAccelerator.config.v2";
   const LEGACY_KEY = "biliAccelerator.config.v1";
-  // Bumped when the candidate pool changes: a cached ranking only ever contains
-  // hosts from the pool that produced it, so a stale entry would pin viewers to
-  // the old mainland-only set for up to RANK_TTL_MS after an update.
-  const RANK_PREFIX = "biliAccelerator.rank.v2.";
+  // Bumped when the pool or the scoring changes: a cached ranking only names
+  // hosts from the pool that produced it, and is only comparable to others
+  // scored the same way. v3 switched scoring from TTFB to measured throughput,
+  // so entries written by v2 would otherwise pin viewers to a latency-ranked
+  // order — mainland-first for some — for up to RANK_TTL_MS after an update.
+  const RANK_PREFIX = "biliAccelerator.rank.v3.";
   const RANK_TTL_MS = 6 * 60 * 60 * 1000;
   const BUTTON_ID = "bili-accelerator-button";
   const PANEL_ID = "bili-accelerator-panel";
@@ -716,6 +750,10 @@
   // Upper bound on parallel probes. Kept at or above CANDIDATE_POOL's length so
   // the pool is measured in full — a unit test holds the two together.
   const PROBE_MAX_HOSTS = 12;
+  // How much of each candidate's body to read before scoring it. Enough to get
+  // past TCP slow-start and see a real rate, small enough that probing the whole
+  // pool moves well under a second of video per host.
+  const PROBE_BYTES = 768 * 1024;
 
   const nativeJsonParse = JSON.parse;
   const nativeFetch = root.fetch;
@@ -936,7 +974,7 @@
       if (Date.now() - parsed.at > RANK_TTL_MS) {
         return null;
       }
-      return parsed.ranking;
+      return parsed;
     } catch (_) {
       return null;
     }
@@ -1447,16 +1485,18 @@
     }
   }
 
-  // TTFB-probe one candidate host by re-requesting the signed sample URL on it.
+  // Probe one candidate host by re-requesting the signed sample URL on it and
+  // reading the first PROBE_BYTES of the body to measure transfer rate.
+  //
   // Uses cors mode (the CDN sends ACAO for the player's own segment fetches) so
   // the real status is visible — under no-cors a host that fast-fails with 403
-  // would look "healthy" and win the ranking. No Range header: it isn't
-  // no-cors/preflight-safe everywhere, and the body is aborted right after the
-  // headers arrive anyway, so only a few KB ever transfer.
+  // would look "healthy" and win the ranking. Still no Range header: it isn't
+  // preflight-safe everywhere, and reading a bounded prefix off the stream then
+  // cancelling gets the same measurement without one.
   function probeHost(host, sampleUrl) {
     const url = swapHost(sampleUrl, host);
     if (!url) {
-      return Promise.resolve({ host, ttfb: null, ok: false });
+      return Promise.resolve({ host, ttfb: null, mbps: 0, ok: false });
     }
     const started = nowMs();
     const init = { method: "GET", mode: "cors", cache: "no-store", credentials: "omit" };
@@ -1469,15 +1509,34 @@
     }
     const probe = nativeFetch(url, init).then(function (response) {
       const ttfb = nowMs() - started;
-      // Headers are in — stop the body download, we only wanted the timing.
-      try {
-        if (response.body && typeof response.body.cancel === "function") {
-          response.body.cancel();
-        }
-      } catch (_) {}
-      return { host, ttfb: response.ok ? ttfb : null, ok: !!response.ok };
+      const body = response.body;
+      if (!response.ok) {
+        try { if (body && body.cancel) { body.cancel(); } } catch (_) {}
+        return { host, ttfb: null, mbps: 0, ok: false };
+      }
+      // Engines without a readable stream still get ranked, on TTFB alone.
+      if (!body || typeof body.getReader !== "function") {
+        return { host, ttfb, mbps: 0, ok: true };
+      }
+      const reader = body.getReader();
+      const firstByteAt = nowMs();
+      let bytes = 0;
+      function pump() {
+        return reader.read().then(function (chunk) {
+          if (chunk.value) {
+            bytes += chunk.value.length;
+          }
+          if (chunk.done || bytes >= PROBE_BYTES) {
+            const elapsed = nowMs() - firstByteAt;
+            try { reader.cancel(); } catch (_) {}
+            return { host, ttfb, mbps: core.throughputMbps(bytes, elapsed), ok: true };
+          }
+          return pump();
+        });
+      }
+      return pump();
     }).catch(function () {
-      return { host, ttfb: null, ok: false };
+      return { host, ttfb: null, mbps: 0, ok: false };
     }).then(function (result) {
       settled = true;
       if (timer) {
@@ -1492,7 +1551,7 @@
     return Promise.race([probe, new Promise(function (resolve) {
       setTimeout(function () {
         if (!settled) {
-          resolve({ host, ttfb: null, ok: false });
+          resolve({ host, ttfb: null, mbps: 0, ok: false });
         }
       }, PROBE_TIMEOUT_MS);
     })]);
@@ -1505,7 +1564,11 @@
     probed = true;
     const cached = loadRanking();
     if (cached) {
-      applyRanking(cached);
+      applyRanking(cached.ranking);
+      // Report when the cached ranking was actually measured. Leaving this null
+      // made a cache hit indistinguishable from "never probed" in diagnostics,
+      // which is how a stale mainland-first ranking went unnoticed.
+      state.probedAt = new Date(cached.at).toISOString();
       renderStatus();
       return;
     }
@@ -2799,7 +2862,8 @@
     rewriteUrl: function (url) { return core.rewriteUrl(url, config); }
   };
 
-  applyRanking(loadRanking());
+  const bootRanking = loadRanking();
+  applyRanking(bootRanking && bootRanking.ranking);
   patchJsonParse();
   patchFetch();
   patchXHR();

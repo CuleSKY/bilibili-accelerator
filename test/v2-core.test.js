@@ -282,3 +282,61 @@ test("an already-current config is not re-migrated", () => {
   assert.equal(cfg.pcdnHost, "upos-sz-mirrorcos.bilivideo.com");
   assert.deepEqual(cfg.candidatePool, ["upos-sz-mirrorhw.bilivideo.com"]);
 });
+
+// ---- v3: ranking signal and force-mode scope ----------------------------------
+
+test("rankHosts ranks on throughput, not time to first byte", () => {
+  // The failure this encodes: a mainland mirror answered headers fastest and so
+  // won a TTFB-only ranking, while actually moving a third of the bytes. Force
+  // mode then routed every segment onto it.
+  const ranked = core.rankHosts([
+    { host: "mainland.bilivideo.com", ttfb: 200, mbps: 19.9, ok: true },
+    { host: "overseas.bilivideo.com", ttfb: 430, mbps: 74.5, ok: true },
+    { host: "dead.bilivideo.com", ttfb: null, mbps: 0, ok: false }
+  ]);
+  assert.deepEqual(ranked, [
+    "overseas.bilivideo.com",
+    "mainland.bilivideo.com",
+    "dead.bilivideo.com"
+  ]);
+});
+
+test("rankHosts falls back to TTFB when no rate was measured", () => {
+  const ranked = core.rankHosts([
+    { host: "slow.bilivideo.com", ttfb: 800, mbps: 0, ok: true },
+    { host: "fast.bilivideo.com", ttfb: 120, mbps: 0, ok: true }
+  ]);
+  assert.deepEqual(ranked, ["fast.bilivideo.com", "slow.bilivideo.com"]);
+});
+
+test("force mode leaves Bilibili's overseas mirrors alone", () => {
+  // Reported case: mode "force" with a mis-ranked mainland target rewrote every
+  // mirrorcosov segment transpacific, which is the stall isSlow was fixed to end.
+  const cfg = { mode: "force", pcdnHost: "upos-sz-mirrorali.bilivideo.com" };
+  ["upos-sz-mirrorcosov.bilivideo.com",
+   "upos-sz-mirroraliov.bilivideo.com",
+   "upos-sz-mirrorhwov.bilivideo.com"].forEach((host) => {
+    const detail = core.rewriteUrlDetail("https://" + host + "/upgcxcode/v.m4s?a=1", cfg);
+    assert.equal(detail.changed, false, host + " must survive force mode");
+    assert.equal(detail.reason, "ok");
+  });
+});
+
+test("force mode still rewrites mainland and unknown CDN hosts", () => {
+  const cfg = { mode: "force", pcdnHost: "upos-sz-mirrorcosov.bilivideo.com" };
+  ["upos-sz-mirrorcos.bilivideo.com", "upos-tf-all-tx.bilivideo.com"].forEach((host) => {
+    const detail = core.rewriteUrlDetail("https://" + host + "/upgcxcode/v.m4s?a=1", cfg);
+    assert.equal(detail.changed, true, host + " should still be forced");
+    assert.equal(new URL(detail.url).hostname, "upos-sz-mirrorcosov.bilivideo.com");
+  });
+});
+
+test("an overseas mirror on a PCDN-ish port is still caught", () => {
+  // The force-mode exemption must not become a way to smuggle a bad host past
+  // the port heuristic.
+  const detail = core.rewriteUrlDetail(
+    "https://upos-sz-mirrorcosov.bilivideo.com:8082/upgcxcode/v.m4s?a=1",
+    { mode: "bad-only", pcdnHost: "upos-sz-mirrorali.bilivideo.com" });
+  assert.equal(detail.changed, true);
+  assert.equal(detail.reason, "pcdn-host");
+});
