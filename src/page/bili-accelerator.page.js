@@ -10,7 +10,12 @@
   const VERSION = "0.4.0";
   const STORAGE_KEY = "biliAccelerator.config.v2";
   const LEGACY_KEY = "biliAccelerator.config.v1";
-  const RANK_PREFIX = "biliAccelerator.rank.";
+  // Bumped when the pool or the scoring changes: a cached ranking only names
+  // hosts from the pool that produced it, and is only comparable to others
+  // scored the same way. v3 switched scoring from TTFB to measured throughput,
+  // so entries written by v2 would otherwise pin viewers to a latency-ranked
+  // order — mainland-first for some — for up to RANK_TTL_MS after an update.
+  const RANK_PREFIX = "biliAccelerator.rank.v3.";
   const RANK_TTL_MS = 6 * 60 * 60 * 1000;
   const BUTTON_ID = "bili-accelerator-button";
   const PANEL_ID = "bili-accelerator-panel";
@@ -21,6 +26,13 @@
   const STALL_GRACE_MS = 2500;
   const STALL_RETRY_MS = 5000;
   const PROBE_TIMEOUT_MS = 4000;
+  // Upper bound on parallel probes. Kept at or above CANDIDATE_POOL's length so
+  // the pool is measured in full — a unit test holds the two together.
+  const PROBE_MAX_HOSTS = 12;
+  // How much of each candidate's body to read before scoring it. Enough to get
+  // past TCP slow-start and see a real rate, small enough that probing the whole
+  // pool moves well under a second of video per host.
+  const PROBE_BYTES = 768 * 1024;
 
   const nativeJsonParse = JSON.parse;
   const nativeFetch = root.fetch;
@@ -33,6 +45,7 @@
   let probed = false;
   let watchedVideo = null;
   let stallTimer = null;
+  let rotateCursor = 0;
 
   const recovery = { avoidHost: null, clearTimer: null };
 
@@ -240,7 +253,7 @@
       if (Date.now() - parsed.at > RANK_TTL_MS) {
         return null;
       }
-      return parsed.ranking;
+      return parsed;
     } catch (_) {
       return null;
     }
@@ -751,16 +764,18 @@
     }
   }
 
-  // TTFB-probe one candidate host by re-requesting the signed sample URL on it.
+  // Probe one candidate host by re-requesting the signed sample URL on it and
+  // reading the first PROBE_BYTES of the body to measure transfer rate.
+  //
   // Uses cors mode (the CDN sends ACAO for the player's own segment fetches) so
   // the real status is visible — under no-cors a host that fast-fails with 403
-  // would look "healthy" and win the ranking. No Range header: it isn't
-  // no-cors/preflight-safe everywhere, and the body is aborted right after the
-  // headers arrive anyway, so only a few KB ever transfer.
+  // would look "healthy" and win the ranking. Still no Range header: it isn't
+  // preflight-safe everywhere, and reading a bounded prefix off the stream then
+  // cancelling gets the same measurement without one.
   function probeHost(host, sampleUrl) {
     const url = swapHost(sampleUrl, host);
     if (!url) {
-      return Promise.resolve({ host, ttfb: null, ok: false });
+      return Promise.resolve({ host, ttfb: null, mbps: 0, ok: false });
     }
     const started = nowMs();
     const init = { method: "GET", mode: "cors", cache: "no-store", credentials: "omit" };
@@ -773,15 +788,34 @@
     }
     const probe = nativeFetch(url, init).then(function (response) {
       const ttfb = nowMs() - started;
-      // Headers are in — stop the body download, we only wanted the timing.
-      try {
-        if (response.body && typeof response.body.cancel === "function") {
-          response.body.cancel();
-        }
-      } catch (_) {}
-      return { host, ttfb: response.ok ? ttfb : null, ok: !!response.ok };
+      const body = response.body;
+      if (!response.ok) {
+        try { if (body && body.cancel) { body.cancel(); } } catch (_) {}
+        return { host, ttfb: null, mbps: 0, ok: false };
+      }
+      // Engines without a readable stream still get ranked, on TTFB alone.
+      if (!body || typeof body.getReader !== "function") {
+        return { host, ttfb, mbps: 0, ok: true };
+      }
+      const reader = body.getReader();
+      const firstByteAt = nowMs();
+      let bytes = 0;
+      function pump() {
+        return reader.read().then(function (chunk) {
+          if (chunk.value) {
+            bytes += chunk.value.length;
+          }
+          if (chunk.done || bytes >= PROBE_BYTES) {
+            const elapsed = nowMs() - firstByteAt;
+            try { reader.cancel(); } catch (_) {}
+            return { host, ttfb, mbps: core.throughputMbps(bytes, elapsed), ok: true };
+          }
+          return pump();
+        });
+      }
+      return pump();
     }).catch(function () {
-      return { host, ttfb: null, ok: false };
+      return { host, ttfb: null, mbps: 0, ok: false };
     }).then(function (result) {
       settled = true;
       if (timer) {
@@ -796,7 +830,7 @@
     return Promise.race([probe, new Promise(function (resolve) {
       setTimeout(function () {
         if (!settled) {
-          resolve({ host, ttfb: null, ok: false });
+          resolve({ host, ttfb: null, mbps: 0, ok: false });
         }
       }, PROBE_TIMEOUT_MS);
     })]);
@@ -809,11 +843,20 @@
     probed = true;
     const cached = loadRanking();
     if (cached) {
-      applyRanking(cached);
+      applyRanking(cached.ranking);
+      // Report when the cached ranking was actually measured. Leaving this null
+      // made a cache hit indistinguishable from "never probed" in diagnostics,
+      // which is how a stale mainland-first ranking went unnoticed.
+      state.probedAt = new Date(cached.at).toISOString();
       renderStatus();
       return;
     }
-    const hosts = (config.candidatePool || []).slice(0, 6);
+    // Probe every candidate. This used to stop at the first six, which silently
+    // made pool *order* decide what auto-selection could pick: a viewer whose
+    // fastest host sat in position seven could never be ranked onto it. The
+    // probes run in parallel and abort their bodies once headers land, so the
+    // whole pool costs one round of a few KB, once per RANK_TTL_MS.
+    const hosts = (config.candidatePool || []).slice(0, PROBE_MAX_HOSTS);
     if (!hosts.length) {
       return;
     }
@@ -833,14 +876,25 @@
       .catch(function () {});
   }
 
+  // Walk the ranked pool one step per stall, wrapping at the end. Taking the
+  // first entry that isn't the current host instead — as this did originally —
+  // ping-pongs between the top two entries forever: rank[0] rotates to rank[1],
+  // whose own stall rotates straight back to rank[0]. The rest of the pool was
+  // unreachable, and a viewer whose best two hosts were both congested saw
+  // "switching servers" every five seconds with nothing to show for it.
   function rotateTarget(stallingHost) {
     const pool = (state.ranking.length ? state.ranking : config.candidatePool).slice();
+    if (!pool.length) {
+      return;
+    }
     const current = config.pcdnHost;
-    const next = pool.filter(function (h) {
-      return h !== current && h !== stallingHost;
-    })[0] || pool.find(function (h) { return h !== current; });
-    if (next) {
-      config.pcdnHost = next;
+    for (let i = 0; i < pool.length; i += 1) {
+      rotateCursor = (rotateCursor + 1) % pool.length;
+      const candidate = pool[rotateCursor];
+      if (candidate !== current && candidate !== stallingHost) {
+        config.pcdnHost = candidate;
+        break;
+      }
     }
     recovery.avoidHost = stallingHost || current;
     if (recovery.clearTimer) {
@@ -2087,7 +2141,8 @@
     rewriteUrl: function (url) { return core.rewriteUrl(url, config); }
   };
 
-  applyRanking(loadRanking());
+  const bootRanking = loadRanking();
+  applyRanking(bootRanking && bootRanking.ranking);
   patchJsonParse();
   patchFetch();
   patchXHR();

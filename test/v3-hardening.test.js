@@ -40,7 +40,7 @@ test("protocol-relative media URLs are parsed and rewritten", () => {
   const detail = core.rewriteUrlDetail("//node-7.edge.mountaintoys.cn:4830/upgcxcode/v.m4s?os=mcdn");
   assert.equal(detail.changed, true);
   assert.equal(new URL(detail.url).protocol, "https:");
-  assert.equal(new URL(detail.url).hostname, "upos-sz-mirrorcos.bilivideo.com");
+  assert.equal(new URL(detail.url).hostname, core.DEFAULT_CONFIG.pcdnHost);
 });
 
 // ---- live-stream safety -------------------------------------------------------
