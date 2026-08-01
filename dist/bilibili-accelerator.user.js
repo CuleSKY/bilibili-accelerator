@@ -1990,6 +1990,12 @@
     if (document.querySelector(".mode-webscreen")) {
       return "web";
     }
+    if (root.location && typeof root.location.hostname === "string") {
+      const host = root.location.hostname.toLowerCase();
+      if (host === "live.bilibili.com" || host === "live.bilibili.tv") {
+        return "web";
+      }
+    }
     return "normal";
   }
 
