@@ -468,7 +468,9 @@
         host = "";
       }
       // During recovery, force-redirect away from the stalling host even if it
-      // would normally be considered healthy.
+      // would normally be considered healthy — with one exception it does not
+      // control: force mode now exempts the overseas mirrors, so a stalling
+      // *ov host is left in place and this override is a no-op for it.
       const cfg = (recovery.avoidHost && host === recovery.avoidHost)
         ? Object.assign({}, config, { mode: "force" })
         : config;

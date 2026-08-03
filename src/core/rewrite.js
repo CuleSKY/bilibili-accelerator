@@ -53,10 +53,12 @@
   // mainland, so a mainland-only pool made every rotation a large downgrade off
   // the host Bilibili had already picked correctly.
   //
-  // Do not read that as "overseas is always right". Issue #26 is a viewer in
-  // Tokyo whose fastest host is mainland upos-sz-mirrorcos, and the whole pool
-  // is probed, so their ranking comes out mainland-first exactly as it should.
-  // Baking either geography into this list is the bug, not the fix.
+  // Do not read that as "overseas is always right". The reporter in #26 watches
+  // from Tokyo and measured mirrorcosov as no slower than mainland mirrorcos —
+  // their v0.3.0 ranking put mirrorcos first, but that was a mainland-only pool
+  // scored on TTFB, so it never measured an *ov host and is not evidence either
+  // way. Probing the whole pool is what settles it per viewer. Baking either
+  // geography into this list is the bug, not the fix.
   const CANDIDATE_POOL = Object.freeze([
     "upos-sz-mirrorcosov.bilivideo.com",
     "upos-sz-mirroraliov.bilivideo.com",
