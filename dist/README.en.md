@@ -55,7 +55,7 @@ Full notes live in [Releases](https://github.com/realzza/bilibili-accelerator/re
 
 | Version | What changed |
 | --- | --- |
-| v0.4.0 | Fixes background playback for overseas viewers: switching to another tab no longer stalls the video after a few seconds (worst on Safari). It was the accelerator rerouting Bilibili's own overseas mirrors and Akamai onto a mainland CDN, which kept the buffer too thin — those good hosts are left alone now. Also stops cloning media responses and keeps tab-switches out of stall recovery. The candidate server list picks up the overseas mirrors too — it was mainland-only, so one stall was enough to move an overseas viewer onto a much slower host. Every candidate gets measured now, and stall switching works through them in turn instead of bouncing between the same two. Ranking is by real download speed rather than how quickly a server answers — answer time swings about tenfold between samples of the same server, so one unlucky reading could pin you to a slow one for hours. **Always switch server** no longer moves you off Bilibili's own overseas mirrors either |
+| v0.4.0 | Fixes background playback for overseas viewers: switching to another tab no longer stalls the video after a few seconds (worst on Safari). It was the accelerator rerouting Bilibili's own overseas mirrors onto a mainland CDN, which kept the buffer too thin — those mirrors are left alone now. Also stops cloning media responses and keeps tab-switches out of stall recovery. The candidate server list picks up the overseas mirrors too — it was mainland-only, so one stall was enough to move an overseas viewer onto a much slower host. Every candidate gets measured now, and stall switching works through them in turn instead of bouncing between the same two. Ranking is by real download speed rather than how quickly a server answers — answer time swings about tenfold between samples of the same server, so one unlucky reading could pin you to a slow one for hours. **Always switch server** no longer moves you off Bilibili's own overseas mirrors either |
 | [v0.3.0](https://github.com/realzza/bilibili-accelerator/releases/tag/v0.3.0) | Light/dark panel and seven accent themes; header theme and language share one sliding control. Core behavior untouched |
 | [v0.2.3](https://github.com/realzza/bilibili-accelerator/releases/tag/v0.2.3) | Stability fixes for live playback, more accurate probing, and stall recovery that keeps retrying |
 | [v0.2.2](https://github.com/realzza/bilibili-accelerator/releases/tag/v0.2.2) | Speed measured over the time data is actually flowing, so a full buffer no longer reads as 0 Mbps |
@@ -68,6 +68,11 @@ Full notes live in [Releases](https://github.com/realzza/bilibili-accelerator/re
 ## Troubleshooting
 
 Check for the ⚡ badge first. Tabs that were open during install or an update have to be reloaded.
+
+No ⚡ on Chrome or Edge, and Tampermonkey says "script hasn't run yet" or asks you to allow user scripts? That's a newer-Tampermonkey (Manifest V3) rule — the browser makes you allow script injection once before any userscript can run, and it has nothing to do with this script. Flip it on:
+
+- **Chrome**: go to `chrome://extensions`, open Tampermonkey's **Details**, and turn on **Allow user scripts**. Older builds don't have that toggle — turn on **Developer mode** (top right) instead.
+- **Edge**: go to `edge://extensions/`, turn on **Developer mode** (bottom left), then open Tampermonkey's **Details** and turn on **Allow user scripts**. If the toggle isn't there, your Edge is too old — update it.
 
 If it still stalls, open Advanced settings, hit **Copy report**, and file an [issue](https://github.com/realzza/bilibili-accelerator/issues) with the video URL, your region, and what you saw. The report contains only what's needed to diagnose the problem — no signed media addresses or query tokens.
 

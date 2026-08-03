@@ -946,7 +946,10 @@
         return null;
       }
       const parsed = JSON.parse(raw);
-      if (!parsed || !Array.isArray(parsed.ranking) || !parsed.at) {
+      // `at` has to be a real timestamp, not just truthy: scheduleProbe formats
+      // it for diagnostics, and a corrupted string would sail past the TTL check
+      // below (NaN compares false) only to throw on an Invalid Date there.
+      if (!parsed || !Array.isArray(parsed.ranking) || typeof parsed.at !== "number") {
         return null;
       }
       if (Date.now() - parsed.at > RANK_TTL_MS) {

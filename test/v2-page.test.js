@@ -449,3 +449,40 @@ test("a host aborted mid-transfer is ranked as slow, not dropped", () => {
     assert.notEqual(ranking[0], slowHost, "but it must not win");
   });
 });
+
+test("a ranking cache with a corrupt timestamp is discarded, not trusted", () => {
+  // loadRanking only checked that `at` was truthy. A non-numeric one survives
+  // the TTL check (NaN compares false either way), so the entry came back as a
+  // fresh cache hit — and scheduleProbe then formats `at` for diagnostics, where
+  // an Invalid Date throws. That took the probe down after `probed` was already
+  // latched, so the viewer was left pinned to whatever stale order the entry
+  // carried, with no probe to correct it.
+  const stale = "upos-sz-mirrorali.bilivideo.com";
+  let probes = 0;
+
+  const sandbox = loadPage({
+    localStorage: {
+      getItem: (key) => key.indexOf("biliAccelerator.rank.") === 0
+        ? JSON.stringify({ ranking: [stale], at: "2026-08-01T00:00:00Z" })
+        : null,
+      setItem() {}
+    },
+    fetch: () => {
+      probes += 1;
+      return Promise.resolve({ ok: true, headers: { get: () => "video/mp4" }, body: null });
+    }
+  });
+
+  sandbox.JSON.parse(JSON.stringify({
+    data: { dash: { video: [
+      { baseUrl: "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/v.m4s?x=1" }
+    ] } }
+  }));
+
+  return new Promise((resolve) => setTimeout(resolve, 50)).then(() => {
+    assert.ok(probes > 0,
+      "an unreadable cache must fall through to a fresh probe, not abort it");
+    assert.notEqual(sandbox.BiliAccelerator.getConfig().pcdnHost, stale,
+      "and its ranking must never be applied");
+  });
+});
