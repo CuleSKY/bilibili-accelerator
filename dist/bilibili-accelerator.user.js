@@ -2118,6 +2118,22 @@
     setBadgeHidden(immersive && !panelIsOpen());
   }
 
+  // Live rooms run a different player: no .bpx-player-container, no data-screen,
+  // nothing detectScreenMode() can read (checked against a real room — a live
+  // page has zero bpx-* elements). Without this the badge sits permanently over
+  // the chat column.
+  //
+  // Kept separate from detectScreenMode() on purpose. That function answers
+  // "what screen mode is the player in", and answering "web" for a live page
+  // would also satisfy the setLifted() test below, nudging the badge to
+  // bottom:84px on every live page as a side effect.
+  function isLivePage() {
+    const host = root.location && typeof root.location.hostname === "string"
+      ? root.location.hostname.toLowerCase()
+      : "";
+    return host === "live.bilibili.com" || host === "live.bilibili.tv";
+  }
+
   function detectScreenMode() {
     const container = document.querySelector(".bpx-player-container");
     if (container) {
@@ -2128,12 +2144,6 @@
     }
     if (document.querySelector(".mode-webscreen")) {
       return "web";
-    }
-    if (root.location && typeof root.location.hostname === "string") {
-      const host = root.location.hostname.toLowerCase();
-      if (host === "live.bilibili.com" || host === "live.bilibili.tv") {
-        return "web";
-      }
     }
     return "normal";
   }
@@ -2148,7 +2158,7 @@
   function refreshImmersive() {
     const mode = detectScreenMode();
     setLifted(mode === "web" || mode === "full" || mode === "wide");
-    setImmersive(mode === "web" || mode === "full");
+    setImmersive(mode === "web" || mode === "full" || isLivePage());
   }
 
   function ensurePlayerObserver() {

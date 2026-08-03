@@ -413,6 +413,11 @@ test("live pages enter immersive mode so the badge can auto-hide", () => {
   assert.ok(host, "installs the floating badge");
   assert.equal(host.classList.contains("ba-immersed"), true,
     "live pages should hide the badge the same way web fullscreen does");
+  // isLivePage() is deliberately not routed through detectScreenMode(): a live
+  // page reporting "web" there would also satisfy refreshImmersive's setLifted
+  // test and shift the badge to bottom:84px, which nothing asked for.
+  assert.equal(host.classList.contains("ba-lifted"), false,
+    "hiding the badge on a live page must not also lift it");
 });
 
 test("bangumi video_info.dash gets backup fan-out; durl gets backup_url fan-out", () => {
