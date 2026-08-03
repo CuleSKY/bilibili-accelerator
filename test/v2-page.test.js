@@ -127,6 +127,124 @@ function loadPageWithVideo() {
   return { sandbox, document, video };
 }
 
+function loadPageWithLiveHost() {
+  const core = fs.readFileSync(path.join(__dirname, "../src/core/rewrite.js"), "utf8");
+  const page = fs.readFileSync(path.join(__dirname, "../src/page/bili-accelerator.page.js"), "utf8");
+  const nodes = new Map();
+
+  function makeElement(tagName) {
+    const classes = new Set();
+    const children = [];
+    const element = {
+      tagName: tagName.toUpperCase(),
+      id: "",
+      style: { setProperty() {} },
+      dataset: {},
+      shadowRoot: null,
+      classList: {
+        add(name) { classes.add(name); },
+        remove(name) { classes.delete(name); },
+        toggle(name, force) {
+          if (force === true) {
+            classes.add(name);
+          } else if (force === false) {
+            classes.delete(name);
+          } else if (classes.has(name)) {
+            classes.delete(name);
+          } else {
+            classes.add(name);
+          }
+          return classes.has(name);
+        },
+        contains(name) { return classes.has(name); }
+      },
+      appendChild(child) {
+        children.push(child);
+        if (child && child.id) {
+          nodes.set(child.id, child);
+        }
+        return child;
+      },
+      addEventListener() {},
+      attachShadow() {
+        const shadow = {
+          appendChild() {},
+          querySelector() { return null; },
+          getElementById() { return null; },
+          querySelectorAll() { return []; }
+        };
+        element.shadowRoot = shadow;
+        return shadow;
+      },
+      setAttribute() {},
+      remove() {},
+      querySelector(selector) {
+        if (selector === "input") {
+          const stack = children.slice();
+          while (stack.length) {
+            const child = stack.shift();
+            if (child && child.tagName === "INPUT") {
+              return child;
+            }
+            if (child && typeof child.querySelector === "function" && Array.isArray(child.__children)) {
+              stack.unshift(...child.__children);
+            }
+          }
+          return null;
+        }
+        return null;
+      },
+      querySelectorAll() { return []; }
+    };
+    element.__children = children;
+    return element;
+  }
+
+  const document = {
+    readyState: "complete",
+    hidden: false,
+    documentElement: makeElement("html"),
+    head: makeElement("head"),
+    addEventListener() {},
+    getElementById(id) {
+      return nodes.get(id) || null;
+    },
+    querySelector(selector) {
+      return selector === "video" ? null : null;
+    },
+    createElement(tagName) {
+      return makeElement(tagName);
+    }
+  };
+
+  const sandbox = {
+    JSON: { parse: JSON.parse, stringify: JSON.stringify },
+    URL, Date, WeakSet, Headers, Response, Request, Promise, Math, Intl,
+    performance: { now: () => 1 },
+    XMLHttpRequest: class FakeXHR {
+      open() {}
+      send() {}
+      addEventListener() {}
+      getResponseHeader() { return "application/json"; }
+    },
+    navigator: { language: "en-US", clipboard: { writeText() {} } },
+    console: { info() {}, warn() {}, error() {} },
+    localStorage: { getItem: () => null, setItem() {} },
+    location: { href: "https://live.bilibili.com/123", hostname: "live.bilibili.com", reload() {} },
+    document,
+    setTimeout(callback) { callback(); return 1; },
+    clearTimeout() {},
+    setInterval() { return 1; },
+    clearInterval() {}
+  };
+  sandbox.globalThis = sandbox;
+  sandbox.window = sandbox;
+  sandbox.addEventListener = () => {};
+
+  vm.runInNewContext(`${core}\n${page}`, sandbox);
+  return { sandbox, document };
+}
+
 test("XHR open() rewrites a renamed PCDN segment URL (mountaintoys)", () => {
   const sandbox = loadPage();
   const xhr = new sandbox.XMLHttpRequest();
@@ -287,6 +405,14 @@ test("live segment URLs pass through untouched (no VOD host swap)", () => {
   const liveUrl = "https://xy1x2x3x4xy.mcdn.bilivideo.cn:486/live-bvc/123/live_1234.flv?os=mcdn";
   xhr.open("GET", liveUrl);
   assert.equal(xhr._url, liveUrl);
+});
+
+test("live pages enter immersive mode so the badge can auto-hide", () => {
+  const { document } = loadPageWithLiveHost();
+  const host = document.getElementById("bili-accelerator-button");
+  assert.ok(host, "installs the floating badge");
+  assert.equal(host.classList.contains("ba-immersed"), true,
+    "live pages should hide the badge the same way web fullscreen does");
 });
 
 test("bangumi video_info.dash gets backup fan-out; durl gets backup_url fan-out", () => {
