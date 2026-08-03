@@ -9,10 +9,12 @@
 })(typeof globalThis !== "undefined" ? globalThis : window, function createCore() {
   "use strict";
 
-  const SCHEMA_VERSION = 2;
+  const SCHEMA_VERSION = 3;
 
-  // Healthy UPOS mirrors we are willing to rewrite toward. The first entry is
-  // the default target; the whole list seeds the auto-selection candidate pool.
+  // Healthy UPOS mirrors we are willing to rewrite toward. The default target
+  // is DEFAULT_CONFIG.pcdnHost and the auto-selection pool is CANDIDATE_POOL;
+  // this list is the wider allowlist, and its first entry is only the last-ditch
+  // fallback for a config whose pcdnHost has somehow been emptied.
   const CDN_HOSTS = Object.freeze([
     "upos-sz-mirrorcos.bilivideo.com",
     "upos-sz-mirrorali.bilivideo.com",
@@ -40,13 +42,31 @@
   ]);
   const THEME_MODES = Object.freeze(["system", "light", "dark"]);
 
-  // Candidates that are safe to auto-probe and rank: non-akamai, non-overseas
-  // mirrors that work well as generic rewrite targets.
+  // Candidates that are safe to auto-probe and rank as rewrite targets. Akamai
+  // is excluded: it rejects a upos-signed path with 403, so it can never win a
+  // probe and only wastes a slot.
+  //
+  // Both tiers belong here and the probe decides between them; the order below
+  // only sets the pre-probe preference. Overseas leads because that is this
+  // tool's audience — measured from Seattle, re-requesting the same signed
+  // segment on each host gave 33-70 Mbps for the *ov mirrors against 3-20 for
+  // mainland, so a mainland-only pool made every rotation a large downgrade off
+  // the host Bilibili had already picked correctly.
+  //
+  // Do not read that as "overseas is always right". The reporter in #26 watches
+  // from Tokyo and measured mirrorcosov as no slower than mainland mirrorcos —
+  // their v0.3.0 ranking put mirrorcos first, but that was a mainland-only pool
+  // scored on TTFB, so it never measured an *ov host and is not evidence either
+  // way. Probing the whole pool is what settles it per viewer. Baking either
+  // geography into this list is the bug, not the fix.
   const CANDIDATE_POOL = Object.freeze([
-    "upos-sz-mirrorcos.bilivideo.com",
+    "upos-sz-mirrorcosov.bilivideo.com",
+    "upos-sz-mirroraliov.bilivideo.com",
+    "upos-sz-mirrorhwov.bilivideo.com",
     "upos-sz-mirrorali.bilivideo.com",
-    "upos-sz-mirrorhw.bilivideo.com",
     "upos-tf-all-hw.bilivideo.com",
+    "upos-sz-mirrorhw.bilivideo.com",
+    "upos-sz-mirrorcos.bilivideo.com",
     "upos-tf-all-tx.bilivideo.com"
   ]);
 
@@ -57,7 +77,9 @@
     theme: "system",                               // system | light | dark surface
     mode: "bad-only",                              // bad-only | force | off
     selection: "auto",                             // auto | fixed
-    pcdnHost: "upos-sz-mirrorcos.bilivideo.com",
+    // Pre-probe rewrite target. Overseas by default to match the audience; auto
+    // selection replaces it with the best-ranked host once probing finishes.
+    pcdnHost: "upos-sz-mirrorcosov.bilivideo.com",
     candidatePool: CANDIDATE_POOL.slice(),
     mcdnStrategy: "proxy-all",                      // proxy-all | proxy-v1 | replace
     proxyHost: "proxy-tf-all-ws.bilivideo.com",
@@ -102,9 +124,31 @@
     return hostname.indexOf("upos-") === 0 && hostname.split(".")[0].indexOf("302") !== -1;
   }
 
-  // Forward-migrate any stored config (v1 or partial) onto the v2 defaults.
+  // Forward-migrate any stored config (v1 or partial) onto the current defaults.
   function normalizeConfig(config) {
+    // Read the version off the raw input: the merge below backfills it from
+    // DEFAULT_CONFIG, which would make every stored config look current.
+    const storedVersion = config && config.schemaVersion;
     const merged = Object.assign({}, DEFAULT_CONFIG, config || {});
+
+    // v3 widened the candidate pool to take in the overseas mirrors. The pool is
+    // not user-editable, so a stored copy is only ever an older default — and
+    // since a non-empty array satisfies the check below, leaving it alone would
+    // pin existing installs to the mainland-only pool permanently.
+    if (!(storedVersion >= 3)) {
+      merged.candidatePool = CANDIDATE_POOL.slice();
+      // Retire the old default target, which auto mode would otherwise keep
+      // using until its first probe lands. Narrow on purpose: only a config
+      // that carries an older version is a saved one, so an explicit host from
+      // a partial/ad-hoc config is never second-guessed. A host the user pinned
+      // is left alone too — in auto mode it is ephemeral anyway, since
+      // applyRanking overwrites it as soon as probing finishes.
+      if (typeof storedVersion === "number" && merged.selection !== "fixed" &&
+          cleanHost(merged.pcdnHost) === "upos-sz-mirrorcos.bilivideo.com") {
+        merged.pcdnHost = DEFAULT_CONFIG.pcdnHost;
+      }
+    }
+
     if (!Array.isArray(merged.candidatePool) || merged.candidatePool.length === 0) {
       merged.candidatePool = CANDIDATE_POOL.slice();
     }
@@ -193,12 +237,6 @@
     return url.searchParams.get("os") === "mcdn" || /(?:^|[?&])os=mcdn(?:&|$)/i.test(url.search);
   }
 
-  function isOverseasMirror(hostname) {
-    return hostname.includes("mirroraliov") ||
-      hostname.includes("mirrorcosov") ||
-      hostname.includes("mirrorhwov");
-  }
-
   // Single source of truth for "what is this host, and is it slow for us".
   // Behavior-based so renamed PCDN families (e.g. *.edge.mountaintoys.cn) are
   // caught by the port/os=mcdn heuristics without needing a hostname update.
@@ -234,9 +272,13 @@
       kind = "upos";
     }
 
-    const isSlow = isPcdn ||
-      isOverseasMirror(hostname) ||
-      (config.rewriteAkamai && akamai);
+    // Only genuinely bad hosts are "slow": P2P/PCDN families, plus Akamai when a
+    // user explicitly opts in. Bilibili's overseas UPOS mirrors (mirrorcosov /
+    // mirroraliov / mirrorhwov) are deliberately NOT slow — this tool is for
+    // overseas viewers, and those mirrors are the geographically-correct, fast
+    // hosts for them. Rewriting them to a mainland host built a thin forward
+    // buffer that Safari's background-tab throttling then starved into a stall.
+    const isSlow = isPcdn || (config.rewriteAkamai && akamai);
 
     return {
       host: hostname,
@@ -325,6 +367,18 @@
       };
     }
 
+    // Force mode rewrites every bili CDN host onto the selected target, overseas
+    // mirrors included. An earlier revision carved the *ov mirrors out, because
+    // force mode was seen rewriting mirrorcosov onto a mainland mirror the probe
+    // had mis-ranked first. The mis-ranking was the bug — TTFB scoring over a
+    // mainland-only pool — and it is fixed. Ranking on measured throughput over
+    // both tiers means the target here is the host that actually tested fastest
+    // for this viewer, which is exactly what force mode is asked to do.
+    //
+    // The carve-out also had to go because stall recovery reaches force mode
+    // through recovery.avoidHost. While it stood, a stalling *ov host could not
+    // be routed away from at all: recovery counted a rotation, rewrote nothing,
+    // and the panel reported a switch that never happened.
     const force = config.mode === "force";
     if (verdict.isSlow || verdict.isMcdn || (force && isBiliCdnHost(url.hostname))) {
       const target = selectTarget(config);
@@ -445,21 +499,34 @@
     }
   }
 
-  // Pure ranking of probed hosts. samples: [{host, ttfb:number|null, ok:bool}].
-  // Healthy hosts first (lowest TTFB wins); failures sink to the bottom.
+  // Pure ranking of probed hosts. samples: [{host, ttfb:number|null,
+  // mbps?:number, ok:bool}]. Healthy hosts first; failures sink to the bottom.
+  //
+  // Transfer rate decides when it was measured, and TTFB only breaks ties. Time
+  // to first byte is mostly RTT, and on these hosts it swings about tenfold
+  // between back-to-back samples of the same host — ranking on it let a mainland
+  // mirror that answered headers promptly outrank an overseas one that actually
+  // moves 3-4x the bytes. What a stalling player needs is sustained throughput.
   function rankHosts(samples) {
     return (samples || [])
       .slice()
       .sort(function compare(a, b) {
-        const aOk = a.ok && typeof a.ttfb === "number";
-        const bOk = b.ok && typeof b.ttfb === "number";
+        const aOk = a.ok && (typeof a.mbps === "number" || typeof a.ttfb === "number");
+        const bOk = b.ok && (typeof b.mbps === "number" || typeof b.ttfb === "number");
         if (aOk !== bOk) {
           return aOk ? -1 : 1;
         }
-        if (aOk && bOk) {
-          return a.ttfb - b.ttfb;
+        if (!aOk) {
+          return 0;
         }
-        return 0;
+        const aRate = typeof a.mbps === "number" ? a.mbps : 0;
+        const bRate = typeof b.mbps === "number" ? b.mbps : 0;
+        if (aRate !== bRate) {
+          return bRate - aRate;
+        }
+        const aLat = typeof a.ttfb === "number" ? a.ttfb : Infinity;
+        const bLat = typeof b.ttfb === "number" ? b.ttfb : Infinity;
+        return aLat - bLat;
       })
       .map(function pickHost(sample) {
         return cleanHost(sample.host);

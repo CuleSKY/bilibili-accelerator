@@ -205,3 +205,156 @@ test("force mode still respects mcdn proxy ordering", () => {
   assert.equal(detail.reason, "mcdn-proxy");
   assert.equal(new URL(detail.url).hostname, "proxy-tf-all-ws.bilivideo.com");
 });
+
+// ---- v3: overseas-first candidate pool ----------------------------------------
+
+test("the candidate pool spans both the overseas and mainland tiers", () => {
+  // Auto-selection can only ever pick a host that is in this pool, so both
+  // tiers have to be present: overseas viewers measured the *ov mirrors 4-9x
+  // faster, while a viewer in Tokyo (issue #26) probed upos-sz-mirrorcos as
+  // their fastest host. Neither tier may be assumed away — the probe decides.
+  ["upos-sz-mirrorcosov.bilivideo.com",
+   "upos-sz-mirroraliov.bilivideo.com",
+   "upos-sz-mirrorhwov.bilivideo.com",
+   "upos-sz-mirrorcos.bilivideo.com",
+   "upos-sz-mirrorali.bilivideo.com",
+   "upos-sz-mirrorhw.bilivideo.com",
+   "upos-tf-all-hw.bilivideo.com",
+   "upos-tf-all-tx.bilivideo.com"].forEach((host) => {
+    assert.ok(core.CANDIDATE_POOL.includes(host), host + " must be a candidate");
+  });
+});
+
+test("akamai stays out of the candidate pool", () => {
+  // Akamai answers a upos-signed path with 403, so it can never pass the
+  // probe's response.ok check — listing it would just burn a probe slot.
+  assert.ok(!core.CANDIDATE_POOL.some((h) => h.includes("akamaized.net")));
+});
+
+test("a stored v2 config is migrated onto the widened candidate pool", () => {
+  const v2 = {
+    schemaVersion: 2,
+    selection: "auto",
+    pcdnHost: "upos-sz-mirrorcos.bilivideo.com",
+    candidatePool: [
+      "upos-sz-mirrorcos.bilivideo.com",
+      "upos-sz-mirrorali.bilivideo.com",
+      "upos-sz-mirrorhw.bilivideo.com",
+      "upos-tf-all-hw.bilivideo.com",
+      "upos-tf-all-tx.bilivideo.com"
+    ]
+  };
+  const cfg = core.normalizeConfig(v2);
+
+  assert.deepEqual(cfg.candidatePool, core.CANDIDATE_POOL.slice(),
+    "the stale mainland-only pool is replaced, not preserved");
+  assert.equal(cfg.pcdnHost, core.DEFAULT_CONFIG.pcdnHost,
+    "the retired default target is moved off the mainland mirror");
+  assert.equal(cfg.schemaVersion, core.SCHEMA_VERSION);
+});
+
+test("migration keeps a host the user pinned in fixed mode", () => {
+  const cfg = core.normalizeConfig({
+    schemaVersion: 2,
+    selection: "fixed",
+    pcdnHost: "upos-sz-mirrorcos.bilivideo.com"
+  });
+  assert.equal(cfg.pcdnHost, "upos-sz-mirrorcos.bilivideo.com");
+  assert.deepEqual(cfg.candidatePool, core.CANDIDATE_POOL.slice());
+});
+
+test("migration leaves a non-default auto target alone", () => {
+  const cfg = core.normalizeConfig({
+    schemaVersion: 2,
+    selection: "auto",
+    pcdnHost: "upos-tf-all-hw.bilivideo.com"
+  });
+  assert.equal(cfg.pcdnHost, "upos-tf-all-hw.bilivideo.com");
+});
+
+test("an already-current config is not re-migrated", () => {
+  const cfg = core.normalizeConfig({
+    schemaVersion: core.SCHEMA_VERSION,
+    selection: "auto",
+    pcdnHost: "upos-sz-mirrorcos.bilivideo.com",
+    candidatePool: ["upos-sz-mirrorhw.bilivideo.com"]
+  });
+  assert.equal(cfg.pcdnHost, "upos-sz-mirrorcos.bilivideo.com");
+  assert.deepEqual(cfg.candidatePool, ["upos-sz-mirrorhw.bilivideo.com"]);
+});
+
+// ---- v3: ranking signal and force-mode scope ----------------------------------
+
+test("rankHosts ranks on throughput, not time to first byte", () => {
+  // The failure this encodes: a mainland mirror answered headers fastest and so
+  // won a TTFB-only ranking, while actually moving a third of the bytes. Force
+  // mode then routed every segment onto it.
+  const ranked = core.rankHosts([
+    { host: "mainland.bilivideo.com", ttfb: 200, mbps: 19.9, ok: true },
+    { host: "overseas.bilivideo.com", ttfb: 430, mbps: 74.5, ok: true },
+    { host: "dead.bilivideo.com", ttfb: null, mbps: 0, ok: false }
+  ]);
+  assert.deepEqual(ranked, [
+    "overseas.bilivideo.com",
+    "mainland.bilivideo.com",
+    "dead.bilivideo.com"
+  ]);
+});
+
+test("rankHosts falls back to TTFB when no rate was measured", () => {
+  const ranked = core.rankHosts([
+    { host: "slow.bilivideo.com", ttfb: 800, mbps: 0, ok: true },
+    { host: "fast.bilivideo.com", ttfb: 120, mbps: 0, ok: true }
+  ]);
+  assert.deepEqual(ranked, ["fast.bilivideo.com", "slow.bilivideo.com"]);
+});
+
+test("force mode reaches the overseas mirrors too", () => {
+  // These were carved out of force mode for a while, because force mode had been
+  // seen rewriting mirrorcosov onto a mainland mirror the probe mis-ranked first.
+  // Throughput ranking over a two-tier pool fixed the mis-ranking, and the
+  // carve-out cost more than it saved: stall recovery drives force mode through
+  // recovery.avoidHost, so a stalling *ov host became unroutable — recovery
+  // counted a rotation and rewrote nothing. In force mode the selected target is
+  // the measured-fastest host, which is what the mode exists to apply.
+  const cfg = { mode: "force", pcdnHost: "upos-sz-mirrorali.bilivideo.com" };
+  ["upos-sz-mirrorcosov.bilivideo.com",
+   "upos-sz-mirroraliov.bilivideo.com",
+   "upos-sz-mirrorhwov.bilivideo.com"].forEach((host) => {
+    const detail = core.rewriteUrlDetail("https://" + host + "/upgcxcode/v.m4s?a=1", cfg);
+    assert.equal(detail.changed, true, host + " must be reachable by force mode");
+    assert.equal(new URL(detail.url).hostname, "upos-sz-mirrorali.bilivideo.com");
+  });
+});
+
+test("bad-only mode still never rewrites the overseas mirrors", () => {
+  // The carve-out above is gone, so this is the only thing standing between the
+  // default configuration and the transpacific reroute that caused the stalls.
+  ["upos-sz-mirrorcosov.bilivideo.com",
+   "upos-sz-mirroraliov.bilivideo.com",
+   "upos-sz-mirrorhwov.bilivideo.com"].forEach((host) => {
+    const detail = core.rewriteUrlDetail("https://" + host + "/upgcxcode/v.m4s?a=1",
+      { mode: "bad-only", pcdnHost: "upos-sz-mirrorali.bilivideo.com" });
+    assert.equal(detail.changed, false, host + " must survive the default mode");
+    assert.equal(detail.reason, "ok");
+  });
+});
+
+test("force mode still rewrites mainland and unknown CDN hosts", () => {
+  const cfg = { mode: "force", pcdnHost: "upos-sz-mirrorcosov.bilivideo.com" };
+  ["upos-sz-mirrorcos.bilivideo.com", "upos-tf-all-tx.bilivideo.com"].forEach((host) => {
+    const detail = core.rewriteUrlDetail("https://" + host + "/upgcxcode/v.m4s?a=1", cfg);
+    assert.equal(detail.changed, true, host + " should still be forced");
+    assert.equal(new URL(detail.url).hostname, "upos-sz-mirrorcosov.bilivideo.com");
+  });
+});
+
+test("an overseas mirror on a PCDN-ish port is still caught", () => {
+  // The force-mode exemption must not become a way to smuggle a bad host past
+  // the port heuristic.
+  const detail = core.rewriteUrlDetail(
+    "https://upos-sz-mirrorcosov.bilivideo.com:8082/upgcxcode/v.m4s?a=1",
+    { mode: "bad-only", pcdnHost: "upos-sz-mirrorali.bilivideo.com" });
+  assert.equal(detail.changed, true);
+  assert.equal(detail.reason, "pcdn-host");
+});

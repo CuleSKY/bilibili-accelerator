@@ -4,7 +4,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 
-function loadPage() {
+function loadPage(extra) {
   const core = fs.readFileSync(path.join(__dirname, "../src/core/rewrite.js"), "utf8");
   const page = fs.readFileSync(path.join(__dirname, "../src/page/bili-accelerator.page.js"), "utf8");
 
@@ -16,7 +16,7 @@ function loadPage() {
   }
 
   const store = new Map();
-  const sandbox = {
+  const sandbox = Object.assign({
     // Each sandbox gets its own JSON object: the page script patches JSON.parse
     // in place, and handing it the host realm's JSON would stack patches across
     // tests (and patch the test runner's own JSON).
@@ -34,7 +34,7 @@ function loadPage() {
       addEventListener() {}, getElementById: () => null,
       querySelector: () => null, createElement: () => ({})
     }
-  };
+  }, extra || {});
   sandbox.globalThis = sandbox;
   sandbox.window = sandbox;
   sandbox.addEventListener = () => {};
@@ -132,11 +132,36 @@ test("XHR open() rewrites a renamed PCDN segment URL (mountaintoys)", () => {
   const xhr = new sandbox.XMLHttpRequest();
   const bad = "https://node-7.edge.mountaintoys.cn:4830/upgcxcode/12/34/567-1-30280.m4s?os=mcdn&abc=1";
   xhr.open("GET", bad);
-  assert.equal(new URL(xhr._url).hostname, "upos-sz-mirrorcos.bilivideo.com");
+  assert.equal(new URL(xhr._url).hostname, sandbox.BiliAcceleratorCore.DEFAULT_CONFIG.pcdnHost);
   assert.equal(new URL(xhr._url).port, "");
 });
 
-test("stall recovery waits until a hidden video tab is visible again", () => {
+test("fetch media responses are returned without cloning or reading their bodies", async () => {
+  let cloneCalls = 0;
+  const response = {
+    headers: { get: () => "video/mp4" },
+    clone() {
+      cloneCalls += 1;
+      throw new Error("media response body must stay untouched");
+    }
+  };
+  const sandbox = loadPage({ fetch: async () => response });
+
+  const result = await sandbox.fetch(
+    "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/video.m4s?x=1"
+  );
+
+  assert.equal(result, response);
+  assert.equal(cloneCalls, 0);
+});
+
+test("a hidden tab defers stall recovery; returning re-checks it", () => {
+  // Backgrounding must not rotate hosts — throttling alone makes the player emit
+  // waiting/stalled, and rotating on that turns a harmless suspension into a real
+  // interruption. But deferring is not the same as ignoring: 'waiting' does not
+  // re-fire for an element that is already waiting, so a stall that began hidden
+  // has no second event to recover from. The visibility re-check is the only
+  // thing covering that case.
   const { sandbox, document, video } = loadPageWithVideo();
 
   video.dispatch("waiting");
@@ -145,13 +170,30 @@ test("stall recovery waits until a hidden video tab is visible again", () => {
   video.dispatch("waiting");
   sandbox.runTimeouts(2500);
   assert.equal(sandbox.BiliAccelerator.getStats().recoveries, 0,
-    "does not rotate CDN hosts after the tab becomes hidden");
+    "does not rotate CDN hosts while the tab is hidden");
 
+  // readyState stays < 3: the stall outlived the tab switch.
   document.hidden = false;
   document.dispatch("visibilitychange");
   sandbox.runTimeouts(2500);
   assert.equal(sandbox.BiliAccelerator.getStats().recoveries, 1,
-    "rechecks an unresolved stall after the tab becomes visible");
+    "re-checks an unresolved stall once the tab is visible again");
+});
+
+test("returning to a tab that recovered on its own does not rotate", () => {
+  // The re-check above must not fire on the brief dip a tab switch itself causes.
+  const { sandbox, document, video } = loadPageWithVideo();
+
+  video.dispatch("waiting");
+  document.hidden = true;
+  document.dispatch("visibilitychange");
+
+  video.readyState = 4;
+  document.hidden = false;
+  document.dispatch("visibilitychange");
+  sandbox.runTimeouts(2500);
+  assert.equal(sandbox.BiliAccelerator.getStats().recoveries, 0,
+    "a player that resumed on its own must not be rotated off its host");
 });
 
 test("playinfo rewrite also adds DASH backupUrl fan-out in auto mode", () => {
@@ -162,7 +204,7 @@ test("playinfo rewrite also adds DASH backupUrl fan-out in auto mode", () => {
     ] } }
   }));
   const v0 = parsed.data.dash.video[0];
-  assert.equal(new URL(v0.baseUrl).hostname, "upos-sz-mirrorcos.bilivideo.com");
+  assert.equal(new URL(v0.baseUrl).hostname, sandbox.BiliAcceleratorCore.DEFAULT_CONFIG.pcdnHost);
   assert.ok(v0.backupUrl.length > 0);
   assert.ok(v0.backupUrl.every((u) => u.includes("/upgcxcode/v.m4s")));
 });
@@ -218,7 +260,7 @@ test("XHR open() accepts URL objects and still rewrites PCDN segments", () => {
   const xhr = new sandbox.XMLHttpRequest();
   const bad = new URL("https://node-7.edge.mountaintoys.cn:4830/upgcxcode/12/34/567-1-30280.m4s?os=mcdn&abc=1");
   xhr.open("GET", bad);
-  assert.equal(new URL(xhr._url).hostname, "upos-sz-mirrorcos.bilivideo.com");
+  assert.equal(new URL(xhr._url).hostname, sandbox.BiliAcceleratorCore.DEFAULT_CONFIG.pcdnHost);
 });
 
 test("live getRoomPlayInfo parsed by the page gets its PCDN hosts filtered", () => {
@@ -256,7 +298,7 @@ test("bangumi video_info.dash gets backup fan-out; durl gets backup_url fan-out"
     }] } } }
   }));
   const entry = bangumi.result.video_info.dash.video[0];
-  assert.equal(new URL(entry.baseUrl).hostname, "upos-sz-mirrorcos.bilivideo.com");
+  assert.equal(new URL(entry.baseUrl).hostname, sandbox.BiliAcceleratorCore.DEFAULT_CONFIG.pcdnHost);
   assert.ok(entry.backupUrl.length > 0);
 
   const durl = sandbox.JSON.parse(JSON.stringify({
@@ -265,4 +307,200 @@ test("bangumi video_info.dash gets backup fan-out; durl gets backup_url fan-out"
   const durlEntry = durl.data.durl[0];
   assert.ok(Array.isArray(durlEntry.backup_url) && durlEntry.backup_url.length > 0);
   assert.ok(durlEntry.backup_url.every((u) => u.includes("/upgcxcode/v.mp4")));
+});
+
+test("repeated stalls walk the whole pool instead of ping-ponging two hosts", () => {
+  // The reported symptom was "keeps switching servers, still buffering": the old
+  // rotation took the first pool entry that wasn't the current host, so rank[0]
+  // rotated to rank[1] and rank[1] rotated straight back to rank[0]. Everything
+  // past the second entry was unreachable no matter how long the stall ran.
+  const { sandbox, video } = loadPageWithVideo();
+  const pool = sandbox.BiliAccelerator.getConfig().candidatePool;
+  const visited = [];
+
+  video.dispatch("waiting");
+  sandbox.runTimeouts(2500);
+  visited.push(sandbox.BiliAccelerator.getConfig().pcdnHost);
+  for (let i = 0; i < pool.length; i += 1) {
+    sandbox.runTimeouts(5000);           // the persistent-stall recheck
+    visited.push(sandbox.BiliAccelerator.getConfig().pcdnHost);
+  }
+
+  const distinct = new Set(visited);
+  assert.ok(distinct.size >= pool.length - 1,
+    "expected to reach nearly every host, saw " + distinct.size + " of " +
+    pool.length + ": " + JSON.stringify(visited));
+  assert.ok(!visited.every((h) => h === visited[0] || h === visited[1]),
+    "rotation must not alternate between just two hosts: " + JSON.stringify(visited));
+  visited.forEach((host) => {
+    assert.ok(pool.includes(host), host + " is not in the candidate pool");
+  });
+});
+
+test("stall rotation stays on hosts the probe ranked, in rank order", () => {
+  // With no probe result the pool order stands in for the ranking; either way a
+  // rotation must never land on a host outside the pool.
+  const { sandbox, video } = loadPageWithVideo();
+  const before = sandbox.BiliAccelerator.getConfig().pcdnHost;
+
+  video.dispatch("waiting");
+  sandbox.runTimeouts(2500);
+  const after = sandbox.BiliAccelerator.getConfig().pcdnHost;
+
+  assert.notEqual(after, before, "a foreground stall moves off the stalling host");
+  assert.equal(sandbox.BiliAccelerator.getStats().recoveries, 1);
+});
+
+test("every candidate host is probed, not just the first few", () => {
+  // Truncating the probe set makes pool *order* decide what auto-selection is
+  // allowed to pick. Issue #26 came from a viewer whose fastest host was a
+  // mainland mirror; if the pool grows past the cap, they can never rank onto it.
+  const src = fs.readFileSync(path.join(__dirname, "../src/page/bili-accelerator.page.js"), "utf8");
+  const cap = Number(/PROBE_MAX_HOSTS = (\d+)/.exec(src)[1]);
+  const core = require("../src/core/rewrite");
+
+  assert.ok(/slice\(0, PROBE_MAX_HOSTS\)/.test(src),
+    "scheduleProbe must bound its probe set by PROBE_MAX_HOSTS");
+  assert.ok(cap >= core.CANDIDATE_POOL.length,
+    "PROBE_MAX_HOSTS (" + cap + ") must cover the whole " +
+    core.CANDIDATE_POOL.length + "-host pool");
+});
+
+test("the probe reads segment bytes instead of scoring on headers alone", () => {
+  // probeHost used to cancel the body the moment headers landed and rank purely
+  // on TTFB. On these hosts TTFB swings ~10x between back-to-back samples of the
+  // SAME host, so one unlucky draw — cached for RANK_TTL_MS — pinned a viewer to
+  // a mainland mirror that moved a third of the bytes. Ranking now needs a real
+  // rate, which means the probe has to actually pull bytes. Ordering semantics
+  // are covered by the rankHosts tests in v2-core; what matters here is that the
+  // body is consumed at all, which the old implementation never did.
+  const core = require("../src/core/rewrite");
+  let readCalls = 0;
+  let bytesServed = 0;
+  let cancelledAtHeaders = 0;
+
+  const sandbox = loadPage({
+    Uint8Array,
+    fetch: () => Promise.resolve({
+      ok: true,
+      headers: { get: () => "video/mp4" },
+      body: {
+        cancel() { cancelledAtHeaders += 1; },
+        getReader: () => ({
+          read() {
+            readCalls += 1;
+            bytesServed += 64 * 1024;
+            return Promise.resolve({ done: false, value: new Uint8Array(64 * 1024) });
+          },
+          cancel() {}
+        })
+      }
+    })
+  });
+
+  // A playinfo payload hands rememberSample() a signed URL to probe with.
+  sandbox.JSON.parse(JSON.stringify({
+    data: { dash: { video: [
+      { baseUrl: "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/v.m4s?x=1" }
+    ] } }
+  }));
+
+  return new Promise((resolve) => setTimeout(resolve, 50)).then(() => {
+    assert.ok(readCalls > 0,
+      "probe must consume the body; the old code cancelled at headers");
+    assert.equal(cancelledAtHeaders, 0,
+      "a healthy response must not be discarded before any bytes are read");
+    // Each probe stops at PROBE_BYTES, so the pool moves that much per host.
+    const src = fs.readFileSync(path.join(__dirname, "../src/page/bili-accelerator.page.js"), "utf8");
+    const probeBytes = eval(/PROBE_BYTES = ([^;]+);/.exec(src)[1]);
+    assert.ok(bytesServed >= probeBytes,
+      "expected at least " + probeBytes + " bytes read, got " + bytesServed);
+    assert.ok(bytesServed <= probeBytes * core.CANDIDATE_POOL.length + 64 * 1024,
+      "probe must stop at PROBE_BYTES per host, read " + bytesServed);
+  });
+});
+
+test("a host aborted mid-transfer is ranked as slow, not dropped", () => {
+  // PROBE_TIMEOUT_MS aborts a host too slow to deliver PROBE_BYTES in time. It
+  // is slow, not broken: discarding it shrank one real ranking to four of eight
+  // hosts, leaving rotation with nothing to fall back on once the fast hosts
+  // were exhausted. The bytes it did move are a valid (low) measurement.
+  const slowHost = "upos-tf-all-tx.bilivideo.com";
+  const sandbox = loadPage({
+    Uint8Array,
+    fetch: (url) => {
+      const host = new URL(url).hostname;
+      let served = 0;
+      return Promise.resolve({
+        ok: true,
+        headers: { get: () => "video/mp4" },
+        body: {
+          getReader: () => ({
+            read() {
+              served += 64 * 1024;
+              // The slow host gets aborted partway through, like a real timeout.
+              if (host === slowHost && served > 128 * 1024) {
+                return Promise.reject(new Error("aborted"));
+              }
+              return Promise.resolve({
+                done: served > 768 * 1024,
+                value: new Uint8Array(64 * 1024)
+              });
+            },
+            cancel() {}
+          })
+        }
+      });
+    }
+  });
+
+  sandbox.JSON.parse(JSON.stringify({
+    data: { dash: { video: [
+      { baseUrl: "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/v.m4s?x=1" }
+    ] } }
+  }));
+
+  return new Promise((resolve) => setTimeout(resolve, 50)).then(() => {
+    const ranking = sandbox.BiliAccelerator.getStats().ranking;
+    assert.ok(ranking.includes(slowHost),
+      "the aborted host must stay rankable: " + JSON.stringify(ranking));
+    assert.notEqual(ranking[0], slowHost, "but it must not win");
+  });
+});
+
+test("a ranking cache with a corrupt timestamp is discarded, not trusted", () => {
+  // loadRanking only checked that `at` was truthy. A non-numeric one survives
+  // the TTL check (NaN compares false either way), so the entry came back as a
+  // fresh cache hit — and scheduleProbe then formats `at` for diagnostics, where
+  // an Invalid Date throws. That took the probe down after `probed` was already
+  // latched, so the viewer was left pinned to whatever stale order the entry
+  // carried, with no probe to correct it.
+  const stale = "upos-sz-mirrorali.bilivideo.com";
+  let probes = 0;
+
+  const sandbox = loadPage({
+    localStorage: {
+      getItem: (key) => key.indexOf("biliAccelerator.rank.") === 0
+        ? JSON.stringify({ ranking: [stale], at: "2026-08-01T00:00:00Z" })
+        : null,
+      setItem() {}
+    },
+    fetch: () => {
+      probes += 1;
+      return Promise.resolve({ ok: true, headers: { get: () => "video/mp4" }, body: null });
+    }
+  });
+
+  sandbox.JSON.parse(JSON.stringify({
+    data: { dash: { video: [
+      { baseUrl: "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/v.m4s?x=1" }
+    ] } }
+  }));
+
+  return new Promise((resolve) => setTimeout(resolve, 50)).then(() => {
+    assert.ok(probes > 0,
+      "an unreadable cache must fall through to a fresh probe, not abort it");
+    assert.notEqual(sandbox.BiliAccelerator.getConfig().pcdnHost, stale,
+      "and its ranking must never be applied");
+  });
 });

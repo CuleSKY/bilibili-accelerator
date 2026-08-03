@@ -7,10 +7,15 @@
   }
   root.__BILI_ACCELERATOR_INSTALLED__ = true;
 
-  const VERSION = "0.3.0";
+  const VERSION = "0.4.0";
   const STORAGE_KEY = "biliAccelerator.config.v2";
   const LEGACY_KEY = "biliAccelerator.config.v1";
-  const RANK_PREFIX = "biliAccelerator.rank.";
+  // Bumped when the pool or the scoring changes: a cached ranking only names
+  // hosts from the pool that produced it, and is only comparable to others
+  // scored the same way. v3 switched scoring from TTFB to measured throughput,
+  // so entries written by v2 would otherwise pin viewers to a latency-ranked
+  // order — mainland-first for some — for up to RANK_TTL_MS after an update.
+  const RANK_PREFIX = "biliAccelerator.rank.v3.";
   const RANK_TTL_MS = 6 * 60 * 60 * 1000;
   const BUTTON_ID = "bili-accelerator-button";
   const PANEL_ID = "bili-accelerator-panel";
@@ -21,6 +26,13 @@
   const STALL_GRACE_MS = 2500;
   const STALL_RETRY_MS = 5000;
   const PROBE_TIMEOUT_MS = 4000;
+  // Upper bound on parallel probes. Kept at or above CANDIDATE_POOL's length so
+  // the pool is measured in full — a unit test holds the two together.
+  const PROBE_MAX_HOSTS = 12;
+  // How much of each candidate's body to read before scoring it. Enough to get
+  // past TCP slow-start and see a real rate, small enough that probing the whole
+  // pool moves well under a second of video per host.
+  const PROBE_BYTES = 768 * 1024;
 
   const nativeJsonParse = JSON.parse;
   const nativeFetch = root.fetch;
@@ -33,6 +45,7 @@
   let probed = false;
   let watchedVideo = null;
   let stallTimer = null;
+  let rotateCursor = 0;
 
   const recovery = { avoidHost: null, clearTimer: null };
 
@@ -234,13 +247,16 @@
         return null;
       }
       const parsed = JSON.parse(raw);
-      if (!parsed || !Array.isArray(parsed.ranking) || !parsed.at) {
+      // `at` has to be a real timestamp, not just truthy: scheduleProbe formats
+      // it for diagnostics, and a corrupted string would sail past the TTL check
+      // below (NaN compares false) only to throw on an Invalid Date there.
+      if (!parsed || !Array.isArray(parsed.ranking) || typeof parsed.at !== "number") {
         return null;
       }
       if (Date.now() - parsed.at > RANK_TTL_MS) {
         return null;
       }
-      return parsed.ranking;
+      return parsed;
     } catch (_) {
       return null;
     }
@@ -452,7 +468,9 @@
         host = "";
       }
       // During recovery, force-redirect away from the stalling host even if it
-      // would normally be considered healthy.
+      // would normally be considered healthy — with one exception it does not
+      // control: force mode now exempts the overseas mirrors, so a stalling
+      // *ov host is left in place and this override is a no-op for it.
       const cfg = (recovery.avoidHost && host === recovery.avoidHost)
         ? Object.assign({}, config, { mode: "force" })
         : config;
@@ -537,11 +555,12 @@
         const isBinary = !contentType ||
           (!contentType.includes("json") && !contentType.includes("text"));
 
-        // Measure real throughput ourselves — Bilibili's CDN omits
-        // Timing-Allow-Origin, so Resource Timing reports 0 bytes. Reading a
-        // clone is non-invasive: the player still gets the original response.
+        // Never clone or consume media bodies here. In particular, Safari may
+        // throttle the page-world reader after a tab is backgrounded; teeing the
+        // player's response for the optional speed graph can then interfere with
+        // MSE playback. XHR transfers are still measured below, and fetch-based
+        // playback falls back to the buffer-ahead graph.
         if (isMedia && isBinary) {
-          measureFetchBytes(response);
           return response;
         }
 
@@ -750,37 +769,75 @@
     }
   }
 
-  // TTFB-probe one candidate host by re-requesting the signed sample URL on it.
+  // Probe one candidate host by re-requesting the signed sample URL on it and
+  // reading the first PROBE_BYTES of the body to measure transfer rate.
+  //
   // Uses cors mode (the CDN sends ACAO for the player's own segment fetches) so
   // the real status is visible — under no-cors a host that fast-fails with 403
-  // would look "healthy" and win the ranking. No Range header: it isn't
-  // no-cors/preflight-safe everywhere, and the body is aborted right after the
-  // headers arrive anyway, so only a few KB ever transfer.
+  // would look "healthy" and win the ranking. Still no Range header: it isn't
+  // preflight-safe everywhere, and reading a bounded prefix off the stream then
+  // cancelling gets the same measurement without one.
   function probeHost(host, sampleUrl) {
     const url = swapHost(sampleUrl, host);
     if (!url) {
-      return Promise.resolve({ host, ttfb: null, ok: false });
+      return Promise.resolve({ host, ttfb: null, mbps: 0, ok: false });
     }
     const started = nowMs();
     const init = { method: "GET", mode: "cors", cache: "no-store", credentials: "omit" };
     const controller = typeof AbortController === "function" ? new AbortController() : null;
     let timer = null;
     let settled = false;
+    // Kept out here so the catch below can still score a transfer the timeout
+    // interrupted, rather than throwing the measurement away.
+    let ttfbMs = null;
+    let firstByteAt = 0;
+    let bytes = 0;
     if (controller) {
       init.signal = controller.signal;
       timer = setTimeout(function () { controller.abort(); }, PROBE_TIMEOUT_MS);
     }
     const probe = nativeFetch(url, init).then(function (response) {
-      const ttfb = nowMs() - started;
-      // Headers are in — stop the body download, we only wanted the timing.
-      try {
-        if (response.body && typeof response.body.cancel === "function") {
-          response.body.cancel();
-        }
-      } catch (_) {}
-      return { host, ttfb: response.ok ? ttfb : null, ok: !!response.ok };
+      ttfbMs = nowMs() - started;
+      const body = response.body;
+      if (!response.ok) {
+        try { if (body && body.cancel) { body.cancel(); } } catch (_) {}
+        return { host, ttfb: null, mbps: 0, ok: false };
+      }
+      // Engines without a readable stream still get ranked, on TTFB alone.
+      if (!body || typeof body.getReader !== "function") {
+        return { host, ttfb: ttfbMs, mbps: 0, ok: true };
+      }
+      const reader = body.getReader();
+      firstByteAt = nowMs();
+      function pump() {
+        return reader.read().then(function (chunk) {
+          if (chunk.value) {
+            bytes += chunk.value.length;
+          }
+          if (chunk.done || bytes >= PROBE_BYTES) {
+            const elapsed = nowMs() - firstByteAt;
+            try { reader.cancel(); } catch (_) {}
+            return { host, ttfb: ttfbMs, mbps: core.throughputMbps(bytes, elapsed), ok: true };
+          }
+          return pump();
+        });
+      }
+      return pump();
     }).catch(function () {
-      return { host, ttfb: null, ok: false };
+      // A host too slow to deliver PROBE_BYTES inside PROBE_TIMEOUT_MS gets
+      // aborted mid-read. It is slow, not broken, and dropping it entirely left
+      // rotation with nothing to fall back to once the faster hosts were
+      // exhausted — one report came back with only four of eight hosts ranked.
+      // Score the bytes it did move so it sorts to the bottom and stays usable.
+      if (ttfbMs !== null && bytes > 0) {
+        return {
+          host,
+          ttfb: ttfbMs,
+          mbps: core.throughputMbps(bytes, nowMs() - firstByteAt),
+          ok: true
+        };
+      }
+      return { host, ttfb: null, mbps: 0, ok: false };
     }).then(function (result) {
       settled = true;
       if (timer) {
@@ -795,7 +852,7 @@
     return Promise.race([probe, new Promise(function (resolve) {
       setTimeout(function () {
         if (!settled) {
-          resolve({ host, ttfb: null, ok: false });
+          resolve({ host, ttfb: null, mbps: 0, ok: false });
         }
       }, PROBE_TIMEOUT_MS);
     })]);
@@ -808,11 +865,23 @@
     probed = true;
     const cached = loadRanking();
     if (cached) {
-      applyRanking(cached);
+      applyRanking(cached.ranking);
+      // Report when the cached ranking was actually measured. Leaving this null
+      // made a cache hit indistinguishable from "never probed" in diagnostics,
+      // which is how a stale mainland-first ranking went unnoticed.
+      state.probedAt = new Date(cached.at).toISOString();
       renderStatus();
       return;
     }
-    const hosts = (config.candidatePool || []).slice(0, 6);
+    // Probe every candidate. This used to stop at the first six, which silently
+    // made pool *order* decide what auto-selection could pick: a viewer whose
+    // fastest host sat in position seven could never be ranked onto it.
+    //
+    // Probes run in parallel and each reads up to PROBE_BYTES, so a full round
+    // costs on the order of PROBE_BYTES x pool size — a few MB, once per
+    // RANK_TTL_MS. That buys a throughput number; scoring on headers alone was
+    // cheaper but ranked the wrong host (see probeHost).
+    const hosts = (config.candidatePool || []).slice(0, PROBE_MAX_HOSTS);
     if (!hosts.length) {
       return;
     }
@@ -832,14 +901,25 @@
       .catch(function () {});
   }
 
+  // Walk the ranked pool one step per stall, wrapping at the end. Taking the
+  // first entry that isn't the current host instead — as this did originally —
+  // ping-pongs between the top two entries forever: rank[0] rotates to rank[1],
+  // whose own stall rotates straight back to rank[0]. The rest of the pool was
+  // unreachable, and a viewer whose best two hosts were both congested saw
+  // "switching servers" every five seconds with nothing to show for it.
   function rotateTarget(stallingHost) {
     const pool = (state.ranking.length ? state.ranking : config.candidatePool).slice();
+    if (!pool.length) {
+      return;
+    }
     const current = config.pcdnHost;
-    const next = pool.filter(function (h) {
-      return h !== current && h !== stallingHost;
-    })[0] || pool.find(function (h) { return h !== current; });
-    if (next) {
-      config.pcdnHost = next;
+    for (let i = 0; i < pool.length; i += 1) {
+      rotateCursor = (rotateCursor + 1) % pool.length;
+      const candidate = pool[rotateCursor];
+      if (candidate !== current && candidate !== stallingHost) {
+        config.pcdnHost = candidate;
+        break;
+      }
     }
     recovery.avoidHost = stallingHost || current;
     if (recovery.clearTimer) {
@@ -862,7 +942,14 @@
     // Browsers throttle media/MSE work in background tabs, which can make the
     // player emit a transient waiting/stalled event. Rotating CDN hosts in that
     // state turns a harmless suspension into a real interruption, so defer the
-    // decision until the page is visible again.
+    // decision until the page is visible again (see onVisibilityChange).
+    //
+    // Do not "simplify" this to ignoring hidden stalls outright. That was tried
+    // while the background stalls were still blamed on tab visibility, and it
+    // drops the one case nothing else covers: a stall that begins hidden and is
+    // still unresolved on return. 'waiting' does not re-fire for an element that
+    // is already waiting, so without the re-check there is no second event to
+    // recover from. The real cause was CDN rerouting, fixed in classify().
     stallTimer = null;
     if (document.hidden || !watchedVideo || watchedVideo.paused || watchedVideo.ended) {
       return;
@@ -919,7 +1006,9 @@
 
     // A waiting event fired while hidden is deliberately ignored. Re-evaluate
     // once foregrounded so a genuine, still-active stall keeps the normal grace
-    // period and recovery behavior.
+    // period and recovery behavior. The grace period is what keeps this from
+    // firing on the brief readyState dip a tab-switch itself produces:
+    // handleStall re-tests readyState >= 3 before it rotates anything.
     if (watchedVideo && !watchedVideo.paused && !watchedVideo.ended &&
         watchedVideo.readyState < 3) {
       onWaiting();
@@ -989,9 +1078,10 @@
   }
 
   // Record one completed media transfer for the active-throughput window. Bytes
-  // are measured at the fetch/XHR layer (see measureFetchBytes and the XHR
-  // loadend counter) rather than via Resource Timing, because Bilibili's media
-  // CDN omits Timing-Allow-Origin and would report 0 transferSize.
+  // are measured at the XHR layer rather than via Resource Timing, because
+  // Bilibili's media CDN omits Timing-Allow-Origin and would report 0
+  // transferSize. Fetch media bodies stay completely untouched; the graph falls
+  // back to buffer health when the player uses fetch.
   function recordTransfer(start, end, bytes) {
     if (!(bytes > 0)) {
       return;
@@ -1001,24 +1091,6 @@
     // spike the rate to absurd values, so only their "bytes seen" flag matters.
     if (end - start >= MIN_TRANSFER_MS) {
       speed.transfers.push({ start: start, end: end, bytes: bytes });
-    }
-  }
-
-  // Count a media response's bytes by reading a clone — the player still gets
-  // the original response untouched, and cloning tees the stream (no re-download).
-  // The clone drains as fast as the network delivers, so start→arrayBuffer is a
-  // clean transfer-duration proxy that excludes idle time between segments.
-  function measureFetchBytes(response) {
-    const start = nowMs();
-    try {
-      response.clone().arrayBuffer().then(function (buf) {
-        recordTransfer(start, nowMs(), buf && buf.byteLength);
-      }).catch(function () {});
-    } catch (_) {
-      const cl = response.headers && response.headers.get("content-length");
-      if (cl && parseInt(cl, 10) > 0) {
-        speed.sawBytes = true;
-      }
     }
   }
 
@@ -2124,7 +2196,8 @@
     rewriteUrl: function (url) { return core.rewriteUrl(url, config); }
   };
 
-  applyRanking(loadRanking());
+  const bootRanking = loadRanking();
+  applyRanking(bootRanking && bootRanking.ranking);
   patchJsonParse();
   patchFetch();
   patchXHR();

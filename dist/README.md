@@ -1,6 +1,6 @@
 # Bilibili Accelerator
 
-[English](./README.en.md) · [Greasy Fork](https://greasyfork.org/en/scripts/582026-bilibili-accelerator) · 当前版本 v0.3.0
+[English](./README.en.md) · [Greasy Fork](https://greasyfork.org/en/scripts/582026-bilibili-accelerator) · 当前版本 v0.4.0
 
 海外看 B 站，热门视频一般没什么问题，冷门视频经常一会儿流畅、一会儿卡死。
 
@@ -55,6 +55,7 @@ npm run build
 
 | 版本 | 主要变化 |
 | --- | --- |
+| v0.4.0 | 后台播放修复：切换至其他标签页后不再于数秒内卡住（Safari 最明显）。起因是加速器将 B 站自家的海外镜像改写至境内 CDN。候选服务器现覆盖境内外两档并全部参与实测，排序改为按实测吞吐而非应答时间，卡顿切换改为遍历完整列表 |
 | [v0.3.0](https://github.com/realzza/bilibili-accelerator/releases/tag/v0.3.0) | 面板深浅色 + 7 套主题色；顶部主题 / 语言改成同一套滑动控件。核心逻辑没动 |
 | [v0.2.3](https://github.com/realzza/bilibili-accelerator/releases/tag/v0.2.3) | 直播场景的稳定性修复；探测逻辑更准确；卡顿恢复会持续重试 |
 | [v0.2.2](https://github.com/realzza/bilibili-accelerator/releases/tag/v0.2.2) | 速度曲线按「数据真正在传输的时段」算，缓冲填满时不再假装掉到 0 |
@@ -67,6 +68,11 @@ npm run build
 ## 遇到问题
 
 先看右下角有没有 ⚡。刚装完或刚更新的话，已经开着的 B 站页面必须刷新一次。
+
+Chrome / Edge 上一直没有 ⚡，Tampermonkey 还提示「script hasn't run yet」或让你打开「allow user scripts」——这是新版 Tampermonkey（Manifest V3）的规矩，浏览器要你手动放行一次才让它注入脚本，跟本脚本无关。开一下就好：
+
+- **Chrome**：进 `chrome://extensions`，点开 Tampermonkey 的「详细信息」，把「允许用户脚本」打开。老版本没这个开关的话，把右上角「开发者模式」打开就行。
+- **Edge**：进 `edge://extensions/`，先开左下角「开发人员模式」，再点开 Tampermonkey 的「详细信息」，把「允许用户脚本」打开。找不到这个开关的话是 Edge 太旧了，更新一下再看。
 
 还是卡的话，打开「高级设置」→「复制诊断报告」，然后带上视频地址、你所在的地区和具体现象发到 [Issues](https://github.com/realzza/bilibili-accelerator/issues)。报告只包含必要的诊断信息，不含带签名参数的完整媒体地址。
 
