@@ -309,15 +309,33 @@ test("rankHosts falls back to TTFB when no rate was measured", () => {
   assert.deepEqual(ranked, ["fast.bilivideo.com", "slow.bilivideo.com"]);
 });
 
-test("force mode leaves Bilibili's overseas mirrors alone", () => {
-  // Reported case: mode "force" with a mis-ranked mainland target rewrote every
-  // mirrorcosov segment transpacific, which is the stall isSlow was fixed to end.
+test("force mode reaches the overseas mirrors too", () => {
+  // These were carved out of force mode for a while, because force mode had been
+  // seen rewriting mirrorcosov onto a mainland mirror the probe mis-ranked first.
+  // Throughput ranking over a two-tier pool fixed the mis-ranking, and the
+  // carve-out cost more than it saved: stall recovery drives force mode through
+  // recovery.avoidHost, so a stalling *ov host became unroutable — recovery
+  // counted a rotation and rewrote nothing. In force mode the selected target is
+  // the measured-fastest host, which is what the mode exists to apply.
   const cfg = { mode: "force", pcdnHost: "upos-sz-mirrorali.bilivideo.com" };
   ["upos-sz-mirrorcosov.bilivideo.com",
    "upos-sz-mirroraliov.bilivideo.com",
    "upos-sz-mirrorhwov.bilivideo.com"].forEach((host) => {
     const detail = core.rewriteUrlDetail("https://" + host + "/upgcxcode/v.m4s?a=1", cfg);
-    assert.equal(detail.changed, false, host + " must survive force mode");
+    assert.equal(detail.changed, true, host + " must be reachable by force mode");
+    assert.equal(new URL(detail.url).hostname, "upos-sz-mirrorali.bilivideo.com");
+  });
+});
+
+test("bad-only mode still never rewrites the overseas mirrors", () => {
+  // The carve-out above is gone, so this is the only thing standing between the
+  // default configuration and the transpacific reroute that caused the stalls.
+  ["upos-sz-mirrorcosov.bilivideo.com",
+   "upos-sz-mirroraliov.bilivideo.com",
+   "upos-sz-mirrorhwov.bilivideo.com"].forEach((host) => {
+    const detail = core.rewriteUrlDetail("https://" + host + "/upgcxcode/v.m4s?a=1",
+      { mode: "bad-only", pcdnHost: "upos-sz-mirrorali.bilivideo.com" });
+    assert.equal(detail.changed, false, host + " must survive the default mode");
     assert.equal(detail.reason, "ok");
   });
 });

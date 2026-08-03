@@ -155,7 +155,13 @@ test("fetch media responses are returned without cloning or reading their bodies
   assert.equal(cloneCalls, 0);
 });
 
-test("tab visibility transitions never trigger stall recovery", () => {
+test("a hidden tab defers stall recovery; returning re-checks it", () => {
+  // Backgrounding must not rotate hosts — throttling alone makes the player emit
+  // waiting/stalled, and rotating on that turns a harmless suspension into a real
+  // interruption. But deferring is not the same as ignoring: 'waiting' does not
+  // re-fire for an element that is already waiting, so a stall that began hidden
+  // has no second event to recover from. The visibility re-check is the only
+  // thing covering that case.
   const { sandbox, document, video } = loadPageWithVideo();
 
   video.dispatch("waiting");
@@ -164,18 +170,30 @@ test("tab visibility transitions never trigger stall recovery", () => {
   video.dispatch("waiting");
   sandbox.runTimeouts(2500);
   assert.equal(sandbox.BiliAccelerator.getStats().recoveries, 0,
-    "does not rotate CDN hosts after the tab becomes hidden");
+    "does not rotate CDN hosts while the tab is hidden");
 
+  // readyState stays < 3: the stall outlived the tab switch.
+  document.hidden = false;
+  document.dispatch("visibilitychange");
+  sandbox.runTimeouts(2500);
+  assert.equal(sandbox.BiliAccelerator.getStats().recoveries, 1,
+    "re-checks an unresolved stall once the tab is visible again");
+});
+
+test("returning to a tab that recovered on its own does not rotate", () => {
+  // The re-check above must not fire on the brief dip a tab switch itself causes.
+  const { sandbox, document, video } = loadPageWithVideo();
+
+  video.dispatch("waiting");
+  document.hidden = true;
+  document.dispatch("visibilitychange");
+
+  video.readyState = 4;
   document.hidden = false;
   document.dispatch("visibilitychange");
   sandbox.runTimeouts(2500);
   assert.equal(sandbox.BiliAccelerator.getStats().recoveries, 0,
-    "does not recheck playback merely because the tab became visible");
-
-  video.dispatch("waiting");
-  sandbox.runTimeouts(2500);
-  assert.equal(sandbox.BiliAccelerator.getStats().recoveries, 1,
-    "still recovers from a foreground waiting event");
+    "a player that resumed on its own must not be rotated off its host");
 });
 
 test("playinfo rewrite also adds DASH backupUrl fan-out in auto mode", () => {

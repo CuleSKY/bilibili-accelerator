@@ -220,16 +220,6 @@
     return /\.mcdn\.bilivideo\.(?:cn|com|net)$/i.test(hostname);
   }
 
-  // Bilibili's own overseas UPOS mirrors (mirrorcosov / aliov / hwov). classify()
-  // deliberately does not treat these as slow — for this tool's audience they are
-  // the geographically correct hosts. This exists only so force mode can leave
-  // them alone too; it is not a "slow" signal.
-  function isOverseasMirror(hostname) {
-    return hostname.indexOf("upos-") === 0 &&
-      hostname.endsWith(".bilivideo.com") &&
-      /ov$/.test(hostname.split(".")[0]);
-  }
-
   function isBiliCdnHost(hostname) {
     return hostname.endsWith(".bilivideo.com") ||
       hostname.endsWith(".bilivideo.cn") ||
@@ -377,17 +367,20 @@
       };
     }
 
-    // Force mode stops short of the overseas mirrors. Its job is to move a
-    // viewer onto their best-ranked host when Bilibili hands them a mediocre
-    // one — not to overrule a correct choice. A real diagnostics report had
-    // force mode rewriting every mirrorcosov segment onto a mainland mirror the
-    // probe had mis-ranked first, rebuilding the exact transpacific stall that
-    // dropping overseas mirrors from isSlow was meant to end. Genuinely
-    // suspicious hosts are still caught: an *ov name on a PCDN-ish port trips
-    // the port heuristic and shows up as isSlow regardless of this.
-    const forceApplies = config.mode === "force" &&
-      isBiliCdnHost(url.hostname) && !isOverseasMirror(url.hostname);
-    if (verdict.isSlow || verdict.isMcdn || forceApplies) {
+    // Force mode rewrites every bili CDN host onto the selected target, overseas
+    // mirrors included. An earlier revision carved the *ov mirrors out, because
+    // force mode was seen rewriting mirrorcosov onto a mainland mirror the probe
+    // had mis-ranked first. The mis-ranking was the bug — TTFB scoring over a
+    // mainland-only pool — and it is fixed. Ranking on measured throughput over
+    // both tiers means the target here is the host that actually tested fastest
+    // for this viewer, which is exactly what force mode is asked to do.
+    //
+    // The carve-out also had to go because stall recovery reaches force mode
+    // through recovery.avoidHost. While it stood, a stalling *ov host could not
+    // be routed away from at all: recovery counted a rotation, rewrote nothing,
+    // and the panel reported a switch that never happened.
+    const force = config.mode === "force";
+    if (verdict.isSlow || verdict.isMcdn || (force && isBiliCdnHost(url.hostname))) {
       const target = selectTarget(config);
       const rewritten = replaceHost(url, target);
       return {
