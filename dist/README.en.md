@@ -55,7 +55,7 @@ Full notes live in [Releases](https://github.com/realzza/bilibili-accelerator/re
 
 | Version | What changed |
 | --- | --- |
-| v0.4.0 | Fixes background playback for overseas viewers: switching tabs no longer stalls the video after a few seconds (worst on Safari). The accelerator had been rewriting Bilibili's own overseas mirrors onto mainland CDNs. Candidate servers now span both tiers and are all measured, ranking is by measured throughput instead of response time, and stall switching walks the full list |
+| v0.4.0 | Fixes background playback for overseas viewers: switching tabs no longer stalls the video after a few seconds (worst on Safari). The accelerator had been rewriting Bilibili's own overseas mirrors onto mainland CDNs. Candidate servers now span both tiers and are all measured, ranking is by measured throughput instead of response time, and stall switching walks the full list. The ⚡ badge also auto-hides on live pages instead of covering the chat column |
 | [v0.3.0](https://github.com/realzza/bilibili-accelerator/releases/tag/v0.3.0) | Light/dark panel and seven accent themes; header theme and language share one sliding control. Core behavior untouched |
 | [v0.2.3](https://github.com/realzza/bilibili-accelerator/releases/tag/v0.2.3) | Stability fixes for live playback, more accurate probing, and stall recovery that keeps retrying |
 | [v0.2.2](https://github.com/realzza/bilibili-accelerator/releases/tag/v0.2.2) | Speed measured over the time data is actually flowing, so a full buffer no longer reads as 0 Mbps |
