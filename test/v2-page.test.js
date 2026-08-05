@@ -42,6 +42,24 @@ function loadPage(extra) {
   return sandbox;
 }
 
+function assertOnlyBackupEnrichmentCanChange(sandbox, payload) {
+  const probe = JSON.parse(JSON.stringify(payload));
+  const tracker = { changed: false, rewrites: [] };
+  sandbox.BiliAcceleratorCore.rewriteObject(
+    probe,
+    sandbox.BiliAccelerator.getConfig(),
+    tracker
+  );
+  const live = sandbox.BiliAcceleratorCore.filterLiveUrlInfo(
+    probe,
+    sandbox.BiliAccelerator.getConfig()
+  );
+
+  assert.equal(tracker.changed, false, "the primary URL is already an official CDN URL");
+  assert.equal(live.changed, false, "the payload has no live url_info entries to filter");
+  assert.deepEqual(probe, payload, "the two core rewrite passes leave the payload unchanged");
+}
+
 function loadPageWithVideo() {
   const core = fs.readFileSync(path.join(__dirname, "../src/core/rewrite.js"), "utf8");
   const page = fs.readFileSync(path.join(__dirname, "../src/page/bili-accelerator.page.js"), "utf8");
@@ -271,6 +289,70 @@ test("fetch media responses are returned without cloning or reading their bodies
 
   assert.equal(result, response);
   assert.equal(cloneCalls, 0);
+});
+
+test("fetch returns JSON when backup enrichment is the only response change", async () => {
+  const payload = {
+    data: { dash: { video: [{
+      baseUrl: "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/v.m4s?x=1",
+      backupUrl: []
+    }] } }
+  };
+  const body = JSON.stringify(payload);
+  const original = new Response(body, {
+    headers: { "content-type": "application/json", "content-length": String(body.length) }
+  });
+  const sandbox = loadPage({ fetch: async () => original });
+  assertOnlyBackupEnrichmentCanChange(sandbox, payload);
+
+  const result = await sandbox.fetch("https://api.bilibili.com/x/player/playurl?avid=1&cid=2");
+
+  assert.notEqual(result, original, "backup-only enrichment must replace the original response");
+  const rewritten = JSON.parse(await result.text());
+  const entry = rewritten.data.dash.video[0];
+  assert.equal(entry.baseUrl, payload.data.dash.video[0].baseUrl);
+  assert.ok(entry.backupUrl.length > 0);
+});
+
+test("XHR exposes JSON when backup enrichment is the only response change", () => {
+  const payload = {
+    data: { durl: [{
+      url: "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/v.mp4?x=1",
+      backup_url: []
+    }] }
+  };
+  const body = JSON.stringify(payload);
+
+  class BackupOnlyXHR {
+    constructor() {
+      this.listeners = new Map();
+      this.responseText = body;
+      this.response = body;
+      this.responseType = "";
+    }
+    open(method, url) { this._method = method; this._url = url; }
+    send() {
+      const listener = this.listeners.get("load");
+      if (listener) listener();
+    }
+    addEventListener(type, listener) { this.listeners.set(type, listener); }
+    getResponseHeader(name) {
+      return name.toLowerCase() === "content-type" ? "application/json" : null;
+    }
+  }
+
+  const sandbox = loadPage({ XMLHttpRequest: BackupOnlyXHR });
+  assertOnlyBackupEnrichmentCanChange(sandbox, payload);
+  const xhr = new sandbox.XMLHttpRequest();
+  xhr.open("GET", "https://api.bilibili.com/x/player/playurl?avid=1&cid=2");
+  xhr.send();
+
+  assert.notEqual(xhr.responseText, body,
+    "backup-only enrichment must replace the original responseText");
+  const rewritten = JSON.parse(xhr.responseText);
+  const entry = rewritten.data.durl[0];
+  assert.equal(entry.url, payload.data.durl[0].url);
+  assert.ok(entry.backup_url.length > 0);
 });
 
 test("a hidden tab defers stall recovery; returning re-checks it", () => {

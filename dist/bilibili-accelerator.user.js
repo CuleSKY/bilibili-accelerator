@@ -1059,13 +1059,21 @@
   function mergeBackups(entry, key, base) {
     const alts = core.alternativesFor(base, config, backupPool());
     if (!alts.length) {
-      return;
+      return false;
     }
     const existing = Array.isArray(entry[key]) ? entry[key] : [];
     const merged = alts.concat(existing).filter(function uniq(u, i, arr) {
       return arr.indexOf(u) === i;
     });
-    entry[key] = merged.slice(0, 8);
+    const next = merged.slice(0, 8);
+    const changed = next.length !== existing.length || next.some(function differs(u, i) {
+      return u !== existing[i];
+    });
+    if (!changed) {
+      return false;
+    }
+    entry[key] = next;
+    return true;
   }
 
   // Add host-swapped alternatives to DASH/durl entries so Bilibili's own
@@ -1076,8 +1084,9 @@
   // snake_case (base_url/backup_url).
   function enrichBackups(payload) {
     if (config.selection !== "auto" || !payload || typeof payload !== "object") {
-      return;
+      return false;
     }
+    let changed = false;
     const containers = [
       payload.data,
       payload.result,
@@ -1088,15 +1097,21 @@
       if (!container || typeof container !== "object") {
         return;
       }
-      enrichDash(container.dash);
-      enrichDurl(container.durl);
+      if (enrichDash(container.dash)) {
+        changed = true;
+      }
+      if (enrichDurl(container.durl)) {
+        changed = true;
+      }
     });
+    return changed;
   }
 
   function enrichDash(dash) {
     if (!dash || typeof dash !== "object") {
-      return;
+      return false;
     }
+    let changed = false;
     ["video", "audio"].forEach(function eachKind(kind) {
       const list = dash[kind];
       if (!Array.isArray(list)) {
@@ -1107,24 +1122,33 @@
           return;
         }
         if (typeof entry.baseUrl === "string") {
-          mergeBackups(entry, "backupUrl", entry.baseUrl);
+          if (mergeBackups(entry, "backupUrl", entry.baseUrl)) {
+            changed = true;
+          }
         }
         if (typeof entry.base_url === "string") {
-          mergeBackups(entry, "backup_url", entry.base_url);
+          if (mergeBackups(entry, "backup_url", entry.base_url)) {
+            changed = true;
+          }
         }
       });
     });
+    return changed;
   }
 
   function enrichDurl(durl) {
     if (!Array.isArray(durl)) {
-      return;
+      return false;
     }
+    let changed = false;
     durl.forEach(function eachEntry(entry) {
       if (entry && typeof entry.url === "string") {
-        mergeBackups(entry, "backup_url", entry.url);
+        if (mergeBackups(entry, "backup_url", entry.url)) {
+          changed = true;
+        }
       }
     });
+    return changed;
   }
 
   function rewritePayload(payload, source) {
@@ -1285,15 +1309,16 @@
           let parsed;
           const tracker = { changed: false, rewrites: [] };
           let live = { changed: false, rewrites: [] };
+          let backupsChanged = false;
           try {
             parsed = nativeJsonParse(text);
             core.rewriteObject(parsed, config, tracker);
-            enrichBackups(parsed);
+            backupsChanged = enrichBackups(parsed);
             live = core.filterLiveUrlInfo(parsed, config);
           } catch (_) {
             return response;
           }
-          if (!tracker.changed && !live.changed) {
+          if (!tracker.changed && !backupsChanged && !live.changed) {
             rememberSample(parsed);
             return response;
           }
@@ -1370,10 +1395,10 @@
             const parsed = nativeJsonParse(text);
             const tracker = { changed: false, rewrites: [] };
             core.rewriteObject(parsed, config, tracker);
-            enrichBackups(parsed);
+            const backupsChanged = enrichBackups(parsed);
             const live = core.filterLiveUrlInfo(parsed, config);
             rememberSample(parsed);
-            if (!tracker.changed && !live.changed) {
+            if (!tracker.changed && !backupsChanged && !live.changed) {
               return;
             }
             const rewrittenText = JSON.stringify(parsed);
